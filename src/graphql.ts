@@ -5,6 +5,7 @@
 // HTTP 200 with an errors array naming the field.
 
 import { DEFAULT_BRANCH, Forge, VIEWER_LOGIN, type Issue, type Pull, type Repo } from './store.ts';
+import { dropIssueJsonCache } from './rest.ts';
 
 // ---------------------------------------------------------------------------------------------
 // lexer + parser (a compact recursive-descent parser for the GraphQL document subset we serve)
@@ -623,6 +624,7 @@ function executeField(ctx: ExecCtx, typeName: string, value: Value, selection: S
       const found = issueFromGlobalId(ctx, input.issueId as string | undefined);
       if (found === null) return null;
       found.issue.state = 'closed';
+      dropIssueJsonCache(found.repo, found.issue.number);
       return resolveObject(ctx, 'CloseIssuePayload', { __kind: 'payload', fields: { issue: { __kind: 'issue', repo: found.repo, issue: found.issue } } }, children);
     }
     if (name === 'createPullRequest') {

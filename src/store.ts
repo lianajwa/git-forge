@@ -104,6 +104,16 @@ export interface Repo {
   nextIssue: number;
   nextPull: number;
   nextCommentId: number;
+  /** Bumped on every change to git objects or refs; read-path caches key on it. */
+  gitGen: number;
+  /** Issues by number, for O(1) single-issue reads. */
+  issueByNumber: Map<number, Issue>;
+  /** Serialized issue JSON by number, for the hot single-issue GET. */
+  issueJsonCache: Map<number, string>;
+  /** Cached sorted refs, valid while `gen` equals `gitGen`. */
+  sortedRefsCache: { gen: number; refs: Array<{ name: string; oid: string }> } | null;
+  /** Cached git wire answers (fetch / ls-refs / v0 ref lines), keyed with `gitGen`. */
+  gitCache: Map<string, Buffer>;
 }
 
 export interface ChangedFile {
@@ -147,6 +157,11 @@ export class Forge {
       nextIssue: 1,
       nextPull: 1,
       nextCommentId: 1,
+      gitGen: 0,
+      issueByNumber: new Map(),
+      issueJsonCache: new Map(),
+      sortedRefsCache: null,
+      gitCache: new Map(),
     };
     this.repos.set(name, repo);
     return repo;
@@ -160,10 +175,22 @@ export class Forge {
     return this.repos.delete(name);
   }
 
+  /**
+   * Mark a repo's git state changed: every read-path cache keyed on `gitGen` (sorted
+   * refs, cached fetch / ls-refs answers) is rebuilt on its next use. Call it at every
+   * site that stores an object or moves a ref.
+   */
+  touchGit(repo: Repo): void {
+    repo.gitGen += 1;
+  }
+
   /** Store an object, answering its id (idempotent: the same bytes give the same id). */
   putObject(repo: Repo, kind: ObjKind, bytes: Buffer): string {
     const oid = oidOf(kind, bytes);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { kind, bytes });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { kind, bytes });
+      this.touchGit(repo);
+    }
     return oid;
   }
 
@@ -181,9 +208,13 @@ export class Forge {
 
   /** Every ref the repo holds, sorted by name (HEAD excluded: it is a symref, not a ref). */
   sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
-    return [...repo.refs.entries()]
+    const cached = repo.sortedRefsCache;
+    if (cached !== null && cached.gen === repo.gitGen) return cached.refs;
+    const refs = [...repo.refs.entries()]
       .map(([name, oid]) => ({ name, oid }))
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    repo.sortedRefsCache = { gen: repo.gitGen, refs };
+    return refs;
   }
 
   /** The commit a tag object peels to (itself when the ref already names a commit). */
@@ -262,6 +293,7 @@ export class Forge {
     });
     const commitSha = this.putObject(repo, 'commit', commitBytes);
     repo.refs.set(refName, commitSha);
+    this.touchGit(repo);
     return { commitSha, blobSha, created };
   }
 
@@ -439,6 +471,7 @@ export class Forge {
     });
     const sha = this.putObject(repo, 'commit', commitBytes);
     repo.refs.set(`refs/heads/${pull.base}`, sha);
+    this.touchGit(repo);
     pull.merged = true;
     pull.mergedAt = SERVER_MERGED_AT;
     pull.mergeSha = sha;
@@ -466,6 +499,7 @@ export class Forge {
       createdAt: isoAt(SERVER_EPOCH + seq),
     };
     repo.issues.push(issue);
+    repo.issueByNumber.set(issue.number, issue);
     repo.comments.set(issue.number, []);
     return { issue };
   }

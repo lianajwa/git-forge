@@ -41,13 +41,40 @@ const V0_UPLOAD_CAPS = 'side-band-64k ofs-delta thin-pack multi_ack shallow symr
 /** The capabilities a v0 receive-pack advertisement carries. */
 const V0_RECEIVE_CAPS = 'report-status side-band-64k delete-refs ofs-delta symref=HEAD:refs/heads/main';
 
+/** The v2 capability advertisement (no refs: v2 lists them through ls-refs). Built once: it never varies. */
+const V2_ADVERTISEMENT = framePkts(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n', 'flush']);
+
+/**
+ * The read-path git cache: a repo's cached wire answers, keyed with its `gitGen` so any
+ * object or ref change rebuilds them. Bounded (32 entries, 1 MiB each): when full it is
+ * cleared and rebuilt, which keeps the hot clone keys live while memory stays small.
+ * Every cached answer is a pure function of the repo's git state and the request's
+ * arguments, so a hit answers byte-identically to a fresh build.
+ */
+const GIT_CACHE_MAX_ENTRIES = 32;
+const GIT_CACHE_MAX_BYTES = 1_048_576;
+
+function gitCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return repo.gitCache.get(key);
+}
+
+function gitCachePut(repo: Repo, key: string, value: Buffer): void {
+  if (value.length > GIT_CACHE_MAX_BYTES) return;
+  if (repo.gitCache.size >= GIT_CACHE_MAX_ENTRIES) repo.gitCache.clear();
+  repo.gitCache.set(key, value);
+}
+
 /** One v0 ref line, the first carrying the capabilities after a NUL. */
 function v0RefLines(repo: Repo, forge: Forge, caps: string): Buffer {
+  const cached = gitCacheGet(repo, `v0:${repo.gitGen}:${caps}`);
+  if (cached !== undefined) return cached;
   const refs = forge.sortedRefs(repo);
   const lines: string[] = [];
   if (refs.length === 0) {
     lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
-    return framePkts(lines.concat(['flush']));
+    const built = framePkts(lines.concat(['flush']));
+    gitCachePut(repo, `v0:${repo.gitGen}:${caps}`, built);
+    return built;
   }
   const defaultTip = forge.branchTip(repo, DEFAULT_BRANCH);
   const headLine = defaultTip !== undefined ? `${defaultTip} HEAD\0${caps}\n` : `${ZERO_OID} HEAD\0${caps}\n`;
@@ -61,12 +88,9 @@ function v0RefLines(repo: Repo, forge: Forge, caps: string): Buffer {
       if (peeled !== null) lines.push(`${peeled} ${ref.name}^{}\n`);
     }
   }
-  return framePkts(lines.concat(['flush']));
-}
-
-/** The v2 capability advertisement (no refs: v2 lists them through ls-refs). */
-function v2Advertisement(): Buffer {
-  return framePkts(['version 2\n', 'ls-refs=unborn\n', 'fetch=shallow\n', 'object-format=sha1\n', 'flush']);
+  const built = framePkts(lines.concat(['flush']));
+  gitCachePut(repo, `v0:${repo.gitGen}:${caps}`, built);
+  return built;
 }
 
 /**
@@ -85,7 +109,7 @@ export function infoRefs(
   const repo = forge.getRepo(repoName);
   if (repo === undefined) return fail(404, 'Not Found');
   if (service === 'git-upload-pack') {
-    if (gitProtocol === 'version=2') return ok(UPLOAD_AD, v2Advertisement());
+    if (gitProtocol === 'version=2') return ok(UPLOAD_AD, V2_ADVERTISEMENT);
     const head = framePkt('# service=git-upload-pack\n');
     return ok(UPLOAD_AD, Buffer.concat([head, frameFlush(), v0RefLines(repo, forge, V0_UPLOAD_CAPS)]));
   }
@@ -125,6 +149,9 @@ function parseLsRefs(lines: string[]): LsRefsArgs {
 
 /** The v2 ls-refs answer: HEAD, every ref, peeled tags, unborn HEAD for an empty repo. */
 function lsRefsAnswer(forge: Forge, repo: Repo, args: LsRefsArgs): Buffer {
+  const key = `ls:${repo.gitGen}:${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}${args.unborn ? 1 : 0}:${[...args.prefixes].sort().join(',')}`;
+  const cached = gitCacheGet(repo, key);
+  if (cached !== undefined) return cached;
   const lines: string[] = [];
   const keep = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
@@ -148,7 +175,9 @@ function lsRefsAnswer(forge: Forge, repo: Repo, args: LsRefsArgs): Buffer {
     }
   }
   lines.push('flush');
-  return framePkts(lines);
+  const built = framePkts(lines);
+  gitCachePut(repo, key, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -228,8 +257,17 @@ function buildFetchPack(
   return { pack: writePack([...objects.values()]), shallow: [], unshallow: [] };
 }
 
+/** The cache key for a fetch answer: the repo's git generation plus every argument that shapes it. */
+function fetchCacheKey(repo: Repo, version: 2 | 0, args: FetchArgs): string {
+  const sortJoin = (values: readonly string[]): string => [...values].sort().join(',');
+  return `fetch${version}:${repo.gitGen}:${sortJoin(args.wants)}|${sortJoin(args.haves)}|${sortJoin(args.shallow)}|${args.depth ?? ''}`;
+}
+
 /** The v2 fetch answer: acknowledgments, shallow-info, packfile sections. */
 function fetchV2Answer(forge: Forge, repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, 2, args);
+  const cached = gitCacheGet(repo, key);
+  if (cached !== undefined) return cached;
   const { pack, shallow, unshallow } = buildFetchPack(forge, repo, args);
   const parts: Buffer[] = [];
   parts.push(framePkt('acknowledgments\n'));
@@ -250,11 +288,16 @@ function fetchV2Answer(forge: Forge, repo: Repo, args: FetchArgs): Buffer {
   parts.push(framePkt('packfile\n'));
   parts.push(sidebandPack(pack));
   parts.push(frameFlush());
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  gitCachePut(repo, key, built);
+  return built;
 }
 
 /** The v0 fetch answer: NAK/ACK/shallow lines, then the sideband pack. */
 function fetchV0Answer(forge: Forge, repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, 0, args);
+  const cached = gitCacheGet(repo, key);
+  if (cached !== undefined) return cached;
   const { pack, shallow, unshallow } = buildFetchPack(forge, repo, args);
   const parts: Buffer[] = [];
   const held = args.haves.filter((have) => repo.objects.has(have));
@@ -264,7 +307,9 @@ function fetchV0Answer(forge: Forge, repo: Repo, args: FetchArgs): Buffer {
   for (const oid of unshallow) parts.push(framePkt(`unshallow ${oid}\n`));
   parts.push(sidebandPack(pack));
   parts.push(frameFlush());
-  return Buffer.concat(parts);
+  const built = Buffer.concat(parts);
+  gitCachePut(repo, key, built);
+  return built;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -339,9 +384,14 @@ export function receivePack(forge: Forge, owner: string, repoName: string, body:
   if (tail.length > 0) {
     try {
       const read = readPack(tail, (oid) => repo.objects.get(oid));
+      let stored = false;
       for (const [oid, object] of read.objects) {
-        if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+        if (!repo.objects.has(oid)) {
+          repo.objects.set(oid, object);
+          stored = true;
+        }
       }
+      if (stored) forge.touchGit(repo);
     } catch (err) {
       unpackOk = false;
       unpackDetail = err instanceof Error ? err.message : 'unpack failed';
@@ -382,6 +432,7 @@ export function receivePack(forge: Forge, owner: string, repoName: string, body:
     if (verdict !== null && verdict.ok) {
       if (command.newOid === ZERO_OID) repo.refs.delete(command.ref);
       else repo.refs.set(command.ref, command.newOid);
+      forge.touchGit(repo);
       reportLines.push(`ok ${command.ref}\n`);
     } else {
       const reason = verdict !== null && !verdict.ok ? verdict.reason : 'failed';

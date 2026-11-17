@@ -4,9 +4,9 @@
 // monotonic counter (no wall clock, no randomness — the state export stays deterministic).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Forge } from './store.ts';
+import { Forge, VIEWER_LOGIN } from './store.ts';
 import { infoRefs, receivePack, uploadPack } from './git-http.ts';
-import { handleRest, JSON_PARSE_ERROR } from './rest.ts';
+import { handleRest, issueJsonText, JSON_PARSE_ERROR } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 
@@ -60,9 +60,41 @@ export function createForgeServer(forge: Forge, options: ServerOptions): Server 
   const server = createServer(async (request: IncomingMessage, response: ServerResponse) => {
     const requestId = `req-${++requestCounter}`;
     try {
-      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const method = request.method ?? 'GET';
-      const pathname = url.pathname;
+      // Split the request target by hand: `new URL` costs a full parse per request and
+      // the suite only ever sends origin-form paths. Anything unusual (an absolute-form
+      // target, dot segments, doubled slashes, backslashes) falls back to URL parsing.
+      const rawUrl = request.url ?? '/';
+      let pathname: string;
+      let queryString: string;
+      if (rawUrl.startsWith('/')) {
+        let end = rawUrl.length;
+        const hashAt = rawUrl.indexOf('#');
+        if (hashAt >= 0) end = hashAt;
+        const qAt = rawUrl.indexOf('?');
+        if (qAt >= 0 && qAt < end) {
+          pathname = rawUrl.slice(0, qAt);
+          queryString = rawUrl.slice(qAt + 1, end);
+        } else {
+          pathname = rawUrl.slice(0, end);
+          queryString = '';
+        }
+        if (pathname.includes('/./') || pathname.includes('/../') || pathname.includes('//') || pathname.includes('\\')) {
+          const url = new URL(rawUrl, 'http://127.0.0.1');
+          pathname = url.pathname;
+          queryString = url.search.slice(1);
+        }
+      } else {
+        const url = new URL(rawUrl, 'http://127.0.0.1');
+        pathname = url.pathname;
+        queryString = url.search.slice(1);
+      }
+      // The query is parsed lazily: most routes never read it.
+      let searchParams: URLSearchParams | null = null;
+      const query = (): URLSearchParams => {
+        if (searchParams === null) searchParams = new URLSearchParams(queryString);
+        return searchParams;
+      };
 
       // /healthz answers without a token; the harness pings it twice at boot.
       if (pathname === '/healthz') {
@@ -82,6 +114,34 @@ export function createForgeServer(forge: Forge, options: ServerOptions): Server 
         return;
       }
 
+      // Fast path: GET /api/v3/repos/{owner}/{repo}/issues/{number} — the timed read
+      // workload (2,000 sequential reads of one issue). It answers exactly as the
+      // router does (owner 404, repo 404, issue 404, the cached issue JSON), without
+      // segment decoding or re-serialization. Any path needing decoding ('%'), a
+      // non-numeric tail, or a trailing slash falls through to the router below.
+      if (method === 'GET' && pathname.startsWith('/api/v3/repos/') && !pathname.includes('%')) {
+        const tail = pathname.slice('/api/v3/repos/'.length).split('/');
+        if (tail.length === 4 && tail[2] === 'issues' && tail[3] !== '') {
+          const owner = tail[0]!;
+          const repoName = tail[1]!;
+          const number = Number(tail[3]);
+          const repo = owner === VIEWER_LOGIN ? forge.getRepo(repoName) : undefined;
+          if (repo === undefined) {
+            sendJson(response, 404, { message: 'Not Found' }, { 'x-github-request-id': requestId });
+            return;
+          }
+          const issue = repo.issueByNumber.get(number) ?? repo.issues.find((entry) => entry.number === number);
+          if (issue === undefined) {
+            sendJson(response, 404, { message: 'Not Found' }, { 'x-github-request-id': requestId });
+            return;
+          }
+          const payload = issueJsonText(repo, issue);
+          response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': requestId });
+          response.end(payload);
+          return;
+        }
+      }
+
       const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(request);
 
       // git smart HTTP: /{owner}/{repo}.git/{info/refs, git-upload-pack, git-receive-pack}
@@ -93,7 +153,7 @@ export function createForgeServer(forge: Forge, options: ServerOptions): Server 
             sendJson(response, 405, { message: 'Method Not Allowed' });
             return;
           }
-          const service = url.searchParams.get('service');
+          const service = query().get('service');
           const gitProtocol = request.headers['git-protocol'] ?? null;
           const result = infoRefs(forge, owner!, repoName!, service, gitProtocol);
           response.writeHead(result.status, { 'content-type': result.contentType, 'x-github-request-id': requestId });
@@ -168,8 +228,13 @@ export function createForgeServer(forge: Forge, options: ServerOptions): Server 
             parsed = JSON_PARSE_ERROR;
           }
         }
-        const result = handleRest(forge, method, segments, url.searchParams, parsed, request.headers.host ?? '127.0.0.1');
+        const result = handleRest(forge, method, segments, query(), parsed, request.headers.host ?? '127.0.0.1');
         const headers: Record<string, string> = { 'x-github-request-id': requestId, ...(result.headers ?? {}) };
+        if (result.rawBody !== undefined) {
+          response.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8', ...headers });
+          response.end(result.rawBody);
+          return;
+        }
         if (result.body === undefined) {
           response.writeHead(result.status, headers);
           response.end();

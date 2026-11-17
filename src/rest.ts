@@ -22,11 +22,18 @@ export interface RestResult {
   status: number;
   /** undefined means no body (204). */
   body?: unknown;
+  /** A pre-serialized JSON body: sent as-is, never re-stringified. */
+  rawBody?: string;
   headers?: Record<string, string>;
 }
 
 function ok(body: unknown, status = 200, headers?: Record<string, string>): RestResult {
   return { status, body, headers };
+}
+
+/** A 200/201 whose body is already a JSON string (the cached issue JSON). */
+function okRaw(rawBody: string, status = 200, headers?: Record<string, string>): RestResult {
+  return { status, rawBody, headers };
 }
 
 function err(status: number, message: string): RestResult {
@@ -92,6 +99,25 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     url: `/api/v3/repos/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`,
     html_url: `https://github.com/${VIEWER_LOGIN}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/**
+ * The serialized issue JSON, cached on the repo. An issue's JSON is a pure function of
+ * the issue and its labels, and labels never change after creation while an issue's
+ * title, body and state change only through the PATCH route (and GraphQL's closeIssue),
+ * which both drop the cached entry — so a hit is byte-identical to a fresh build.
+ */
+export function issueJsonText(repo: Repo, issue: Issue): string {
+  const cached = repo.issueJsonCache.get(issue.number);
+  if (cached !== undefined) return cached;
+  const built = JSON.stringify(issueJson(repo, issue));
+  repo.issueJsonCache.set(issue.number, built);
+  return built;
+}
+
+/** Drop one issue's cached JSON after a mutation (PATCH, GraphQL closeIssue). */
+export function dropIssueJsonCache(repo: Repo, issueNumber: number): void {
+  repo.issueJsonCache.delete(issueNumber);
 }
 
 export function pullJson(repo: Repo, pull: Pull, forge: Forge): Record<string, unknown> {
@@ -337,6 +363,7 @@ function handleRepo(
     const target = repo.objects.get(sha);
     if (!target || !/^[0-9a-f]{40}$/.test(sha)) return err(422, 'Invalid SHA');
     repo.refs.set(ref, sha);
+    forge.touchGit(repo);
     return ok({ ref, object: { sha, type: target.kind } }, 201);
   }
   if (tail[0] === 'git' && tail[1] === 'refs' && tail[2] === 'heads' && tail.length === 4 && method === 'GET') {
@@ -468,9 +495,9 @@ function handleRepo(
   }
   if (tail[0] === 'issues' && tail.length === 2) {
     const number = Number(tail[1]);
-    const issue = repo.issues.find((entry) => entry.number === number);
+    const issue = repo.issueByNumber.get(number) ?? repo.issues.find((entry) => entry.number === number);
     if (issue === undefined) return notFound('Not Found');
-    if (method === 'GET') return ok(issueJson(repo, issue));
+    if (method === 'GET') return okRaw(issueJsonText(repo, issue));
     if (method === 'PATCH') {
       const input = bodyObject(body);
       const state = bodyString(input, 'state');
@@ -479,7 +506,8 @@ function handleRepo(
       if (title !== undefined) issue.title = title;
       const bodyText = bodyString(input, 'body');
       if (bodyText !== undefined) issue.body = bodyText;
-      return ok(issueJson(repo, issue));
+      dropIssueJsonCache(repo, issue.number);
+      return okRaw(issueJsonText(repo, issue));
     }
     return notFound();
   }
