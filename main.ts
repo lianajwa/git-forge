@@ -8,8 +8,10 @@
 // $MAKEFUN_ENV_URL/done until it answers {"done": true}. Retries use a short exponential
 // backoff; the process never exits before the env says done.
 
-import { createForgeServer } from './src/server.ts';
-import { Forge } from './src/store.ts';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { chmod, copyFile, mkdtemp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 /** One register or done request may take this long before it is abandoned and retried. */
 const REQUEST_BUDGET_MS = 30_000;
@@ -25,7 +27,6 @@ function backoff(failures: number): number {
 }
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 /**
  * Tell the env which port the forge bound. 200 is the normal answer; 409 means a first
@@ -68,37 +69,85 @@ async function waitUntilDone(envUrl: string): Promise<void> {
   }
 }
 
+/**
+ * Start the Go core: the shipped binary is copied to a fresh temp dir (web-UI uploads
+ * lose the exec bit and /bot may be read-only there), made executable, spawned with
+ * this process's environment (so it sees MAKEFUN_SHOP_TOKEN), and its FORGE_LISTEN
+ * line read back for the port it bound. The core serves every surface; this process
+ * only registers the port with the env and waits for done.
+ */
+async function launchGoCore(): Promise<{ child: ChildProcess; port: number }> {
+  const dir = await mkdtemp(join(tmpdir(), 'forge-'));
+  const binPath = join(dir, 'forge');
+  await copyFile(new URL('./go/forge', import.meta.url), binPath);
+  await chmod(binPath, 0o755);
+  const child = spawn(binPath, [], { stdio: ['ignore', 'pipe', 'inherit'], env: process.env });
+  const port = await new Promise<number>((resolve, reject) => {
+    let buffer = '';
+    let settled = false;
+    child.stdout!.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      const line = buffer.slice(0, newline).trim();
+      const match = /^FORGE_LISTEN (\d+)$/.exec(line);
+      if (match === null) {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`unexpected Go core output: ${line}`));
+        }
+        return;
+      }
+      if (!settled) {
+        settled = true;
+        resolve(Number(match[1]));
+      }
+    });
+    child.once('close', (code) => {
+      if (!settled) {
+        settled = true;
+        reject(new Error(`Go core exited before listening (code ${code})`));
+      }
+    });
+    child.once('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+  });
+  return { child, port };
+}
+
 /** Bind the forge, register with the env when one exists, and run until the env says done. */
 async function run(): Promise<void> {
-  const forge = new Forge();
-  const server = createForgeServer(forge, { token: SHOP_TOKEN === '' ? null : SHOP_TOKEN });
+  const { child, port } = await launchGoCore();
+  // If this launcher is killed, take the core down with it instead of orphaning it.
+  process.once('SIGINT', () => {
+    child.kill();
+    process.exit(130);
+  });
+  process.once('SIGTERM', () => {
+    child.kill();
+    process.exit(143);
+  });
 
   if (ENV_URL === '') {
-    // Local run: serve on PORT for testing, no env to register with.
-    const port = Number(process.env.PORT ?? '8080');
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(port, '127.0.0.1', () => resolve());
-    });
+    // Local run: serve on the core's port for testing, no env to register with.
     process.stdout.write(`[forge] listening on http://127.0.0.1:${port} (no MAKEFUN_ENV_URL; local mode)\n`);
     // Stay alive serving requests until the process is stopped.
     await new Promise<void>(() => {});
     return;
   }
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[forge] listening on port ${address.port}\n`);
+  process.stdout.write(`[forge] listening on port ${port}\n`);
 
-  await announcePort(ENV_URL, address.port);
+  await announcePort(ENV_URL, port);
   process.stdout.write('[forge] registered; waiting for the env to say done\n');
 
   await waitUntilDone(ENV_URL);
-  server.close();
+  child.kill();
+  await new Promise<void>((resolve) => child.once('close', () => resolve()));
   process.stdout.write('[forge] done\n');
 }
 
