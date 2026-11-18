@@ -25,9 +25,9 @@ func restOK(body any, status int, headers map[string]string) RestResult {
 	return RestResult{Status: status, Body: body, Headers: headers}
 }
 
-// restOKRaw is a 200/201 whose body is already a JSON string (the cached issue JSON).
-func restOKRaw(rawBody string, status int, headers map[string]string) RestResult {
-	return RestResult{Status: status, RawBody: []byte(rawBody), Headers: headers}
+// restOKRaw is a 200/201 whose body is already JSON bytes (the cached issue JSON).
+func restOKRaw(rawBody []byte, status int, headers map[string]string) RestResult {
+	return RestResult{Status: status, RawBody: rawBody, Headers: headers}
 }
 
 func restErr(status int, message string) RestResult {
@@ -164,18 +164,19 @@ func IssueJSON(repo *Repo, issue *Issue) issueView {
 	}
 }
 
-// IssueJSONText returns the serialized issue JSON, cached on the repo. An issue's
+// IssueJSONText returns the serialized issue JSON bytes, cached on the repo. An issue's
 // JSON is a pure function of the issue and its labels, and labels never change after
 // creation while an issue's title, body and state change only through the PATCH route
 // (and GraphQL's closeIssue), which both drop the cached entry — so a hit is
-// byte-identical to a fresh build.
-func IssueJSONText(repo *Repo, issue *Issue) string {
+// byte-identical to a fresh build. The returned bytes are the cache's own: callers
+// must never mutate them (the writer only reads them).
+func IssueJSONText(repo *Repo, issue *Issue) []byte {
 	repo.cacheMu.Lock()
 	defer repo.cacheMu.Unlock()
 	if cached, ok := repo.issueJsonCache[issue.Number]; ok {
 		return cached
 	}
-	built := string(mustJSON(IssueJSON(repo, issue)))
+	built := mustJSON(IssueJSON(repo, issue))
 	repo.issueJsonCache[issue.Number] = built
 	return built
 }

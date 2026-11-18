@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+
+	_ "net/http/pprof"
 )
 
 func main() {
@@ -34,6 +36,14 @@ func main() {
 	port = listener.Addr().(*net.TCPAddr).Port
 	fmt.Printf("FORGE_LISTEN %d\n", port)
 
+	// FORGE_PPROF=1 starts a debug server on 127.0.0.1:6060 (pprof endpoints)
+	// for local profiling only; unset in production, where it costs nothing.
+	if os.Getenv("FORGE_PPROF") != "" {
+		go func() {
+			_ = http.ListenAndServe("127.0.0.1:6060", nil)
+		}()
+	}
+
 	// Exit cleanly when the launcher kills us.
 	go func() {
 		ch := make(chan os.Signal, 1)
@@ -42,7 +52,15 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := http.Serve(listener, server); err != nil {
-		log.Fatalf("[forge] serve: %v", err)
+	// FORGE_NETHTTP=1 keeps the net/http server (A/B + fallback); the default is
+	// the raw-TCP HTTP/1.1 server in rawhttp.go.
+	if os.Getenv("FORGE_NETHTTP") != "" {
+		if err := http.Serve(listener, server); err != nil {
+			log.Fatalf("[forge] serve: %v", err)
+		}
+	} else {
+		if err := serveRaw(listener, server); err != nil {
+			log.Fatalf("[forge] serve: %v", err)
+		}
 	}
 }

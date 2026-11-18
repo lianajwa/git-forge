@@ -12,8 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"regexp"
 	"sort"
+	"sync"
 	"strconv"
 	"strings"
 )
@@ -37,11 +37,22 @@ type GitObj struct {
 // ZERO_OID is the all-zero object id.
 const ZERO_OID = "0000000000000000000000000000000000000000"
 
-var hex40Re = regexp.MustCompile(`^[0-9a-f]{40}$`)
+func isHex40(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		c := value[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
-// IsOid reports whether value is a 40-hex object id.
+// IsOid reports whether value is a 40-hex object id (lowercase, as git writes them).
 func IsOid(value string) bool {
-	return hex40Re.MatchString(value)
+	return isHex40(value)
 }
 
 // OidOf is git's object id: SHA-1 over `<kind> <size>\0` + the object's bytes.
@@ -75,14 +86,22 @@ type Pkt struct {
 	Payload []byte
 }
 
+const hexDigits = "0123456789abcdef"
+
+// appendPktHeader appends a 4-hex-digit pkt-line length header for a payload of n
+// bytes (n counts the payload only; the header covers payload+4). No allocation.
+func appendPktHeader(out []byte, n int) []byte {
+	total := n + 4
+	return append(out, hexDigits[(total>>12)&0xf], hexDigits[(total>>8)&0xf], hexDigits[(total>>4)&0xf], hexDigits[total&0xf])
+}
+
 // FramePkt frames one data payload as a pkt-line.
 func FramePkt(payload []byte) ([]byte, error) {
 	if len(payload) > PKT_MAX-4 {
 		return nil, fmt.Errorf("pkt-line payload of %d bytes exceeds the limit", len(payload))
 	}
-	head := fmt.Sprintf("%04x", len(payload)+4)
 	out := make([]byte, 0, len(payload)+4)
-	out = append(out, head...)
+	out = appendPktHeader(out, len(payload))
 	out = append(out, payload...)
 	return out, nil
 }
@@ -136,24 +155,50 @@ func FramePkts(items []PktItem) ([]byte, error) {
 }
 
 // framePktStrings is a convenience for framing string lines plus control words.
+// It sizes the answer once and writes straight into it: no item slice, no per-line
+// allocation, one buffer out.
 func framePktStrings(items []string) ([]byte, error) {
-	pkts := make([]PktItem, 0, len(items))
+	total := 0
+	for _, item := range items {
+		switch item {
+		case "flush", "delim", "end":
+			total += 4
+		default:
+			if len(item) > PKT_MAX-4 {
+				return nil, fmt.Errorf("pkt-line payload of %d bytes exceeds the limit", len(item))
+			}
+			total += len(item) + 4
+		}
+	}
+	out := make([]byte, 0, total)
 	for _, item := range items {
 		switch item {
 		case "flush":
-			pkts = append(pkts, PktItem{Kind: PktFlush})
+			out = append(out, "0000"...)
 		case "delim":
-			pkts = append(pkts, PktItem{Kind: PktDelim})
+			out = append(out, "0001"...)
 		case "end":
-			pkts = append(pkts, PktItem{Kind: PktEnd})
+			out = append(out, "0002"...)
 		default:
-			pkts = append(pkts, PktItem{Kind: PktData, Payload: []byte(item)})
+			out = appendPktHeader(out, len(item))
+			out = append(out, item...)
 		}
 	}
-	return FramePkts(pkts)
+	return out, nil
 }
 
-var pktHeadRe = regexp.MustCompile(`^[0-9a-fA-F]{4}$`)
+// isPktHead reports whether the 4 bytes are a pkt-line length in hex (either case).
+func isPktHead(head []byte) bool {
+	if len(head) != 4 {
+		return false
+	}
+	for _, c := range head {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
 
 // DecodePkts decodes a whole buffer into packets. When allowRawTail is set, decoding
 // stops at the first non-pkt-line header and returns the rest as the tail (a
@@ -165,16 +210,15 @@ func DecodePkts(buf []byte, allowRawTail bool) ([]Pkt, []byte, error) {
 		if at+4 > len(buf) {
 			return nil, nil, errors.New("truncated pkt-line header")
 		}
-		head := string(buf[at : at+4])
-		if !pktHeadRe.MatchString(head) {
+		if !isPktHead(buf[at : at+4]) {
 			if allowRawTail {
 				break
 			}
-			return nil, nil, fmt.Errorf("bad pkt-line length %q", head)
+			return nil, nil, fmt.Errorf("bad pkt-line length %q", string(buf[at:at+4]))
 		}
-		length, err := strconv.ParseInt(head, 16, 32)
+		length, err := strconv.ParseInt(string(buf[at:at+4]), 16, 32)
 		if err != nil {
-			return nil, nil, fmt.Errorf("bad pkt-line length %q", head)
+			return nil, nil, fmt.Errorf("bad pkt-line length %q", string(buf[at:at+4]))
 		}
 		switch length {
 		case 0:
@@ -593,23 +637,53 @@ func readOfsBase(buf []byte, start int) (baseOffset int, next int, err error) {
 	return value, at, nil
 }
 
+// pooledInflate reuses one zlib reader (with its 32 KiB flate window) across pack
+// entries, so unpacking a pack stops allocating a fresh decompressor per object.
+// The bytes.Reader is reused too; the output buffer is always fresh (the entry's
+// declared size, which the object store keeps).
+type pooledInflate struct {
+	br *bytes.Reader
+	zr io.ReadCloser
+}
+
+var inflatePool = sync.Pool{New: func() any { return &pooledInflate{br: bytes.NewReader(nil)} }}
+
 // inflateAt inflates one zlib stream at offset; it returns the bytes and the offset
 // just past the stream. The reader counts bytes exactly (bytes.Reader is a
-// io.ByteReader, so the flate reader never reads past the stream's end).
-func inflateAt(buf []byte, offset int) ([]byte, int, error) {
-	r := bytes.NewReader(buf[offset:])
-	zr, err := zlib.NewReader(r)
+// io.ByteReader, so the flate reader never reads past the stream's end). The
+// output buffer is sized to the entry's declared size, so no growing copy happens;
+// a final read forces the stream to EOF, consuming and verifying the adler32,
+// before the consumed count is taken.
+func inflateAt(buf []byte, offset int, size int) ([]byte, int, error) {
+	p := inflatePool.Get().(*pooledInflate)
+	defer inflatePool.Put(p)
+	p.br.Reset(buf[offset:])
+	var err error
+	if p.zr == nil {
+		p.zr, err = zlib.NewReader(p.br)
+	} else if rs, ok := p.zr.(zlib.Resetter); ok {
+		err = rs.Reset(p.br, nil)
+	} else {
+		p.zr, err = zlib.NewReader(p.br)
+	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %v", offset, err)
 	}
-	data, err := io.ReadAll(zr)
-	if closeErr := zr.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
+	data := make([]byte, size)
+	if _, err := io.ReadFull(p.zr, data); err != nil {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %v", offset, err)
 	}
-	consumed := len(buf[offset:]) - r.Len()
+	var one [1]byte
+	if _, err := p.zr.Read(one[:]); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("zlib stream at offset %d produced more than %d bytes", offset, size)
+		}
+		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %v", offset, err)
+	}
+	if err := p.zr.Close(); err != nil {
+		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %v", offset, err)
+	}
+	consumed := len(buf[offset:]) - p.br.Len()
 	if consumed == 0 {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d consumed no bytes", offset)
 	}
@@ -785,12 +859,9 @@ func ReadPack(pack []byte, resolveBase func(oid string) *GitObj) (*PackRead, err
 		} else if _, ok := codeType[typeCode]; !ok {
 			return nil, fmt.Errorf("pack entry %d has unknown type code %d", index, typeCode)
 		}
-		inflated, nextOff, err := inflateAt(pack[:trailerStart], at)
+		inflated, nextOff, err := inflateAt(pack[:trailerStart], at, size)
 		if err != nil {
 			return nil, err
-		}
-		if len(inflated) != size {
-			return nil, fmt.Errorf("pack entry at %d declares %d bytes but inflated to %d", entryOffset, size, len(inflated))
 		}
 		entry.data = inflated
 		at = nextOff

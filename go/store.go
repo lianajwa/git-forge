@@ -131,7 +131,8 @@ type Repo struct {
 	// IssueByNumber maps issue numbers to issues, for O(1) single-issue reads.
 	IssueByNumber map[int]*Issue
 	// issueJsonCache holds serialized issue JSON by number, for the hot single-issue GET.
-	issueJsonCache map[int]string
+	// It stores the wire bytes directly: the fast path writes them without a copy.
+	issueJsonCache map[int][]byte
 	// sortedRefsCache holds cached sorted refs, valid while gen equals GitGen.
 	sortedRefsCache *sortedRefsEntry
 	// gitCache holds cached git wire answers (fetch / ls-refs / v0 ref lines).
@@ -217,7 +218,7 @@ func (f *Forge) CreateRepo(name string, isPrivate bool, description string) *Rep
 		NextPull:       1,
 		NextComment:    1,
 		IssueByNumber:  make(map[int]*Issue),
-		issueJsonCache: make(map[int]string),
+		issueJsonCache: make(map[int][]byte),
 		gitCache:       make(map[string][]byte),
 	}
 	f.nextDatabaseID++

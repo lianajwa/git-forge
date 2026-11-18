@@ -350,20 +350,31 @@ func buildFetchPack(forge *Forge, repo *Repo, args FetchArgs) (pack []byte, shal
 	return pack, nil, nil, nil
 }
 
-// fetchCacheKey is the cache key for a fetch answer: the repo's git generation plus
-// every argument that shapes it.
-func fetchCacheKey(repo *Repo, version int, args FetchArgs) string {
-	sortJoin := func(values []string) string {
+// cacheKeyPart renders one fetch argument list for a cache key: empty for none, the
+// single value as-is, and a sorted comma-join only when there are several (sorting
+// a 0- or 1-element list is a no-op, so the common fetch skips the copy+sort).
+func cacheKeyPart(values []string) string {
+	switch len(values) {
+	case 0:
+		return ""
+	case 1:
+		return values[0]
+	default:
 		sorted := append([]string{}, values...)
 		sort.Strings(sorted)
 		return strings.Join(sorted, ",")
 	}
+}
+
+// fetchCacheKey is the cache key for a fetch answer: the repo's git generation plus
+// every argument that shapes it.
+func fetchCacheKey(repo *Repo, version int, args FetchArgs) string {
 	depth := ""
 	if args.Depth != nil {
 		depth = itoa(*args.Depth)
 	}
 	return "fetch" + itoa(version) + ":" + itoa(int(repo.GitGen)) + ":" +
-		sortJoin(args.Wants) + "|" + sortJoin(args.Haves) + "|" + sortJoin(args.Shallow) + "|" + depth
+		cacheKeyPart(args.Wants) + "|" + cacheKeyPart(args.Haves) + "|" + cacheKeyPart(args.Shallow) + "|" + depth
 }
 
 // fetchV2Answer returns the v2 fetch answer: acknowledgments, shallow-info, packfile sections.
