@@ -1,653 +1,663 @@
-// githttp.go — git smart HTTP: info/refs advertisements (protocol v0 and v2),
-// upload-pack (v2 ls-refs/fetch, v0 fetch) and receive-pack (push with report-status).
-// The wire shapes follow the git smart-HTTP protocol: pkt-line framing, sideband pack
-// delivery, shallow/deepen negotiation, and per-ref push reports.
-
+// Git smart HTTP: upload-pack (v2 and v0) and receive-pack (v0).
+//
+// Wire shapes follow the kit's git-client exactly:
+//   - info/refs?service=git-upload-pack answers a v2 capability advertisement
+//     ("version 2", ls-refs=unborn, fetch=shallow filter, object-format=sha1)
+//     behind the "# service=git-upload-pack" preamble.
+//   - info/refs?service=git-receive-pack answers a v0 ref advertisement with
+//     report-status, side-band-64k, delete-refs and ofs-delta.
+//   - upload-pack v2 fetch answers sections: acknowledgments (NAK/ACK),
+//     shallow-info, packfile (sideband band 1).
+//   - upload-pack v0 fetch answers NAK/ACK and shallow lines, then the pack
+//     as sideband.
+//   - receive-pack answers the report-status stream inside sideband band 1.
 package main
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-const (
-	uploadAdvertisement  = "application/x-git-upload-pack-advertisement"
-	uploadResult         = "application/x-git-upload-pack-result"
-	receiveAdvertisement = "application/x-git-receive-pack-advertisement"
-	receiveResult        = "application/x-git-receive-pack-result"
-)
+// --- pkt-lines --------------------------------------------------------------
 
-// GitHTTPResult is one smart-HTTP answer.
-type GitHTTPResult struct {
-	Status      int
-	ContentType string
-	Body        []byte
+func pktLine(payload []byte) []byte {
+	out := make([]byte, 4+len(payload))
+	n := len(payload) + 4
+	out[0] = hexDigit(byte(n>>12) & 0xf)
+	out[1] = hexDigit(byte(n>>8) & 0xf)
+	out[2] = hexDigit(byte(n>>4) & 0xf)
+	out[3] = hexDigit(byte(n) & 0xf)
+	copy(out[4:], payload)
+	return out
 }
 
-func gitOK(contentType string, body []byte) GitHTTPResult {
-	return GitHTTPResult{Status: 200, ContentType: contentType, Body: body}
+func pktStr(s string) []byte { return pktLine([]byte(s)) }
+
+var pktFlush = []byte("0000")
+var pktDelim = []byte("0001")
+
+// pktSideband wraps data as one sideband packet (band 1 = pack data).
+func pktSideband(data []byte) []byte {
+	payload := make([]byte, 1+len(data))
+	payload[0] = 1
+	copy(payload[1:], data)
+	return pktLine(payload)
 }
 
-func gitFail(status int, message string) GitHTTPResult {
-	return GitHTTPResult{Status: status, ContentType: "application/json; charset=utf-8", Body: mustJSON(NewOMap().Set("message", message))}
+// parsePktLines splits a request body into data lines. Returns the lines
+// (without trailing \n), plus flush/delim markers as empty strings with kind.
+type pkt struct {
+	kind string // "data" | "flush" | "delim"
+	text string
 }
 
-// V0UploadCaps are the capabilities a v0 upload-pack advertisement carries (after
-// NUL on the first line).
-const V0UploadCaps = "side-band-64k ofs-delta thin-pack multi_ack shallow symref=HEAD:refs/heads/main"
-
-// V0ReceiveCaps are the capabilities a v0 receive-pack advertisement carries.
-const V0ReceiveCaps = "report-status side-band-64k delete-refs ofs-delta symref=HEAD:refs/heads/main"
-
-// v2Advertisement is the v2 capability advertisement (no refs: v2 lists them through
-// ls-refs). Built once: it never varies.
-var v2Advertisement = mustFramePktStrings([]string{"version 2\n", "ls-refs=unborn\n", "fetch=shallow\n", "object-format=sha1\n", "flush"})
-
-func mustFramePktStrings(items []string) []byte {
-	out, err := framePktStrings(items)
-	if err != nil {
-		panic(err)
+func parsePktLines(body []byte) []pkt {
+	var out []pkt
+	i := 0
+	for i+4 <= len(body) {
+		n, err := strconv.ParseInt(string(body[i:i+4]), 16, 32)
+		if err != nil || n < 0 {
+			break
+		}
+		if n == 0 {
+			out = append(out, pkt{kind: "flush"})
+			i += 4
+			continue
+		}
+		if n == 1 {
+			out = append(out, pkt{kind: "delim"})
+			i += 4
+			continue
+		}
+		if i+int(n) > len(body) {
+			break
+		}
+		out = append(out, pkt{kind: "data", text: string(body[i+4 : i+int(n)])})
+		i += int(n)
 	}
 	return out
 }
 
-// The read-path git cache: a repo's cached wire answers, keyed with its GitGen so any
-// object or ref change rebuilds them. Bounded (32 entries, 1 MiB each): when full it
-// is cleared and rebuilt, which keeps the hot clone keys live while memory stays small.
-// Every cached answer is a pure function of the repo's git state and the request's
-// arguments, so a hit answers byte-identically to a fresh build.
-const gitCacheMaxEntries = 32
-const gitCacheMaxBytes = 1048576
+// --- ref advertisement -------------------------------------------------------
 
-func gitCacheGet(repo *Repo, key string) []byte {
-	repo.cacheMu.Lock()
-	defer repo.cacheMu.Unlock()
-	return repo.gitCache[key]
+// sortedRefs returns ref names sorted, with HEAD first when present.
+func sortedRefs(r *Repo) []string {
+	names := make([]string, 0, len(r.Refs)+1)
+	for name := range r.Refs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
-func gitCachePut(repo *Repo, key string, value []byte) {
-	if len(value) > gitCacheMaxBytes {
-		return
+// refOID returns the oid of a ref, resolving HEAD to the default branch.
+func (r *Repo) refOID(name string) (string, bool) {
+	if name == "HEAD" {
+		oid, ok := r.Refs["refs/heads/"+r.DefaultBranch]
+		return oid, ok
 	}
-	repo.cacheMu.Lock()
-	defer repo.cacheMu.Unlock()
-	if len(repo.gitCache) >= gitCacheMaxEntries {
-		repo.gitCache = make(map[string][]byte)
-	}
-	repo.gitCache[key] = value
+	oid, ok := r.Refs[name]
+	return oid, ok
 }
 
-// v0RefLines returns one v0 ref line set, the first carrying the capabilities after a NUL.
-func v0RefLines(repo *Repo, forge *Forge, caps string) []byte {
-	key := "v0:" + itoa(int(repo.GitGen)) + ":" + caps
-	if cached := gitCacheGet(repo, key); cached != nil {
-		return cached
+// v2Advertisement is the upload-pack v2 capability advertisement body.
+func v2Advertisement() []byte {
+	var b bytes.Buffer
+	b.Write(pktStr("# service=git-upload-pack\n"))
+	b.Write(pktFlush)
+	b.Write(pktStr("version 2\n"))
+	b.Write(pktStr("ls-refs=unborn\n"))
+	b.Write(pktStr("fetch=shallow filter\n"))
+	b.Write(pktStr("object-format=sha1\n"))
+	b.Write(pktStr("agent=forge-v5/1.0\n"))
+	b.Write(pktFlush)
+	return b.Bytes()
+}
+
+// v0Advertisement is a v0 ref advertisement for service (upload-pack or
+// receive-pack). capabilities are advertised on the first line after NUL.
+func v0Advertisement(r *Repo, service string, caps string) []byte {
+	var b bytes.Buffer
+	b.Write(pktStr("# service=" + service + "\n"))
+	b.Write(pktFlush)
+	names := sortedRefs(r)
+	headOID, headOK := r.refOID("HEAD")
+	if len(names) == 0 {
+		// empty repository: capabilities^{} pseudo-ref
+		b.Write(pktStr(zeroOID + " capabilities^{}\x00" + caps + "\n"))
+		b.Write(pktFlush)
+		return b.Bytes()
 	}
-	refs := forge.SortedRefs(repo)
-	var lines []string
-	if len(refs) == 0 {
-		lines = append(lines, ZERO_OID+" capabilities^{}\x00"+caps+"\n")
-		built := mustFramePktStrings(append(lines, "flush"))
-		gitCachePut(repo, key, built)
-		return built
+	first := true
+	writeRef := func(oid, name string) {
+		line := oid + " " + name
+		if first {
+			line += "\x00" + caps
+			first = false
+		}
+		// HEAD carries the symref capability value, not a line suffix; the
+		// client reads symref from the capabilities map.
+		b.Write(pktStr(line + "\n"))
 	}
-	defaultTip, hasTip := forge.BranchTip(repo, DefaultBranch)
-	headLine := ZERO_OID + " HEAD\x00" + caps + "\n"
-	if hasTip {
-		headLine = defaultTip + " HEAD\x00" + caps + "\n"
+	if headOK {
+		writeRef(headOID, "HEAD")
 	}
-	lines = append(lines, headLine)
-	for _, ref := range refs {
-		lines = append(lines, ref.Oid+" "+ref.Name+"\n")
-		// An annotated tag peels to its commit on a `^{}` line.
-		if object, ok := repo.Objects[ref.Oid]; ok && object.Kind == KindTag {
-			if peeled, ok := forge.Peel(repo, ref.Oid); ok {
-				lines = append(lines, peeled+" "+ref.Name+"^{}\n")
+	for _, name := range names {
+		oid := r.Refs[name]
+		writeRef(oid, name)
+		// peeled line for annotated tags
+		if strings.HasPrefix(name, "refs/tags/") {
+			if obj := r.Objects[oid]; obj != nil && obj.Type == "tag" {
+				target, _ := parseTag(obj.Data)
+				if target != "" {
+					b.Write(pktStr(target + " " + name + "^{}\n"))
+				}
 			}
 		}
 	}
-	built := mustFramePktStrings(append(lines, "flush"))
-	gitCachePut(repo, key, built)
-	return built
+	b.Write(pktFlush)
+	return b.Bytes()
 }
 
-// InfoRefs answers GET /{owner}/{repo}.git/info/refs?service=git-upload-pack|
-// git-receive-pack. The Git-Protocol: version=2 header selects the v2 advertisement
-// for upload-pack; receive-pack is always v0.
-func InfoRefs(forge *Forge, owner string, repoName string, service string, gitProtocol string) GitHTTPResult {
-	if owner != ViewerLogin {
-		return gitFail(404, "Not Found")
-	}
-	repo := forge.GetRepo(repoName)
-	if repo == nil {
-		return gitFail(404, "Not Found")
-	}
-	if service == "git-upload-pack" {
-		if gitProtocol == "version=2" {
-			return gitOK(uploadAdvertisement, v2Advertisement)
+// --- pack building -----------------------------------------------------------
+
+// buildPackFor returns the pack bytes for the objects reachable from tips,
+// excluding anything reachable from haves, limited to depth generations
+// (depth < 0 = full). Also returns the shallow boundary oids and the full
+// reachable set (used for correct unshallow lines).
+func buildPackFor(r *Repo, tips []string, haves []string, depth int, clientShallow []string) ([]byte, []string, map[string]bool) {
+	want, shallow := reachable(r, tips, depth)
+	if len(haves) > 0 {
+		var stopAt map[string]bool
+		if len(clientShallow) > 0 {
+			stopAt = make(map[string]bool, len(clientShallow))
+			for _, sh := range clientShallow {
+				stopAt[sh] = true
+			}
 		}
-		head, _ := FramePktString("# service=git-upload-pack\n")
-		body := append(append(append([]byte{}, head...), FrameFlush()...), v0RefLines(repo, forge, V0UploadCaps)...)
-		return gitOK(uploadAdvertisement, body)
+		haveSet, _ := reachableStop(r, haves, -1, stopAt)
+		for oid := range haveSet {
+			delete(want, oid)
+		}
 	}
-	if service == "git-receive-pack" {
-		head, _ := FramePktString("# service=git-receive-pack\n")
-		body := append(append(append([]byte{}, head...), FrameFlush()...), v0RefLines(repo, forge, V0ReceiveCaps)...)
-		return gitOK(receiveAdvertisement, body)
+	oids := make([]string, 0, len(want))
+	for oid := range want {
+		oids = append(oids, oid)
 	}
-	return gitFail(400, "unknown service")
+	sort.Strings(oids)
+	objs := make([]*Object, 0, len(oids))
+	for _, oid := range oids {
+		if o := r.Objects[oid]; o != nil {
+			objs = append(objs, o)
+		}
+	}
+	return writePack(objs), shallow, want
 }
 
-// ---------------------------------------------------------------------------------------------
-// v2 ls-refs
-// ---------------------------------------------------------------------------------------------
-
-// LsRefsArgs are the parsed arguments of a v2 ls-refs request.
-type LsRefsArgs struct {
-	Peel     bool
-	Symrefs  bool
-	Unborn   bool
-	Prefixes []string
+// packCacheKey identifies a cached clone pack.
+func packCacheKey(tips []string, depth int, haves int) string {
+	var sb strings.Builder
+	for _, t := range tips {
+		sb.WriteString(t)
+		sb.WriteByte(',')
+	}
+	sb.WriteString(strconv.Itoa(depth))
+	sb.WriteByte(',')
+	sb.WriteString(strconv.Itoa(haves))
+	return sb.String()
 }
 
-func parseLsRefs(lines []string) LsRefsArgs {
-	args := LsRefsArgs{}
-	for _, line := range lines {
-		text := strings.TrimSuffix(line, "\n")
-		if text == "" {
+// --- upload-pack v2 -----------------------------------------------------------
+
+type fetchArgs struct {
+	wants    []string
+	haves    []string
+	shallow  []string
+	depth    int // -1 = none
+	done     bool
+	thinPack bool
+}
+
+func parseFetchV2(lines []pkt) fetchArgs {
+	var fa fetchArgs
+	fa.depth = -1
+	inArgs := false
+	for _, p := range lines {
+		if p.kind == "delim" {
+			inArgs = true
 			continue
 		}
-		if strings.HasPrefix(text, "command=") || strings.HasPrefix(text, "agent=") || strings.HasPrefix(text, "object-format=") {
+		if p.kind != "data" {
 			continue
 		}
+		if !inArgs {
+			continue // command=/agent=/object-format= lines
+		}
+		text := strings.TrimSuffix(p.text, "\n")
+		switch {
+		case strings.HasPrefix(text, "want "):
+			fa.wants = append(fa.wants, text[5:])
+		case strings.HasPrefix(text, "have "):
+			fa.haves = append(fa.haves, text[5:])
+		case strings.HasPrefix(text, "shallow "):
+			fa.shallow = append(fa.shallow, text[8:])
+		case strings.HasPrefix(text, "deepen "):
+			n, _ := strconv.Atoi(text[7:])
+			fa.depth = n
+		case text == "done":
+			fa.done = true
+		case text == "thin-pack":
+			fa.thinPack = true
+		}
+	}
+	return fa
+}
+
+// handleUploadPackV2 serves one POST /git-upload-pack (v2 command request).
+func handleUploadPackV2(s *Store, r *Repo, body []byte) []byte {
+	lines := parsePktLines(body)
+	var cmd string
+	for _, p := range lines {
+		if p.kind == "data" && strings.HasPrefix(p.text, "command=") {
+			cmd = strings.TrimSuffix(p.text[len("command="):], "\n")
+			break
+		}
+	}
+	switch cmd {
+	case "ls-refs":
+		return lsRefsV2(s, r, lines)
+	case "fetch":
+		return fetchV2(s, r, lines)
+	default:
+		// unknown command: empty response
+		return pktFlush
+	}
+}
+
+func lsRefsV2(s *Store, r *Repo, lines []pkt) []byte {
+	// parse args after delim: peel, symrefs, unborn, ref-prefix X
+	var prefixes []string
+	peel, symrefs, unborn := false, false, false
+	inArgs := false
+	for _, p := range lines {
+		if p.kind == "delim" {
+			inArgs = true
+			continue
+		}
+		if p.kind != "data" || !inArgs {
+			continue
+		}
+		text := strings.TrimSuffix(p.text, "\n")
 		switch {
 		case text == "peel":
-			args.Peel = true
+			peel = true
 		case text == "symrefs":
-			args.Symrefs = true
+			symrefs = true
 		case text == "unborn":
-			args.Unborn = true
+			unborn = true
 		case strings.HasPrefix(text, "ref-prefix "):
-			args.Prefixes = append(args.Prefixes, text[len("ref-prefix "):])
+			prefixes = append(prefixes, text[len("ref-prefix "):])
 		}
 	}
-	return args
-}
-
-// lsRefsAnswer returns the v2 ls-refs answer: HEAD, every ref, peeled tags, unborn
-// HEAD for an empty repo.
-func lsRefsAnswer(forge *Forge, repo *Repo, args LsRefsArgs) []byte {
-	boolBit := func(b bool) string {
-		if b {
-			return "1"
-		}
-		return "0"
-	}
-	sortedPrefixes := append([]string{}, args.Prefixes...)
-	sort.Strings(sortedPrefixes)
-	key := "ls:" + itoa(int(repo.GitGen)) + ":" + boolBit(args.Peel) + boolBit(args.Symrefs) + boolBit(args.Unborn) + ":" + strings.Join(sortedPrefixes, ",")
-	if cached := gitCacheGet(repo, key); cached != nil {
-		return cached
-	}
-	var lines []string
+	_ = unborn
+	var b bytes.Buffer
 	keep := func(name string) bool {
-		if len(args.Prefixes) == 0 {
+		if len(prefixes) == 0 {
 			return true
 		}
-		for _, prefix := range args.Prefixes {
-			if strings.HasPrefix(name, prefix) {
+		for _, pre := range prefixes {
+			if strings.HasPrefix(name, pre) {
 				return true
 			}
 		}
 		return false
 	}
-	refs := forge.SortedRefs(repo)
-	defaultTip, hasTip := forge.BranchTip(repo, DefaultBranch)
-	if len(refs) == 0 {
-		if args.Unborn && keep("HEAD") {
-			lines = append(lines, "unborn HEAD symref-target:refs/heads/main\n")
-		}
-	} else {
-		if keep("HEAD") && hasTip {
-			lines = append(lines, defaultTip+" HEAD symref-target:refs/heads/main\n")
-		}
-		for _, ref := range refs {
-			if !keep(ref.Name) {
-				continue
+	names := sortedRefs(r)
+	if len(names) == 0 {
+		if keep("HEAD") {
+			head := "unborn HEAD"
+			if symrefs {
+				head += " symref-target:refs/heads/" + r.DefaultBranch
 			}
-			line := ref.Oid + " " + ref.Name
-			if object, ok := repo.Objects[ref.Oid]; args.Peel && ok && object.Kind == KindTag {
-				if peeled, ok := forge.Peel(repo, ref.Oid); ok {
-					line += " peeled:" + peeled
+			b.Write(pktStr(head + "\n"))
+		}
+		b.Write(pktFlush)
+		return b.Bytes()
+	}
+	headOID, headOK := r.refOID("HEAD")
+	if headOK && keep("HEAD") {
+		line := headOID + " HEAD"
+		if symrefs {
+			line += " symref-target:refs/heads/" + r.DefaultBranch
+		}
+		b.Write(pktStr(line + "\n"))
+	}
+	for _, name := range names {
+		if !keep(name) {
+			continue
+		}
+		oid := r.Refs[name]
+		line := oid + " " + name
+		if peel && strings.HasPrefix(name, "refs/tags/") {
+			if obj := r.Objects[oid]; obj != nil && obj.Type == "tag" {
+				target, _ := parseTag(obj.Data)
+				if target != "" {
+					line += " peeled:" + target
 				}
 			}
-			lines = append(lines, line+"\n")
 		}
+		b.Write(pktStr(line + "\n"))
 	}
-	lines = append(lines, "flush")
-	built := mustFramePktStrings(lines)
-	gitCachePut(repo, key, built)
-	return built
+	b.Write(pktFlush)
+	return b.Bytes()
 }
 
-// ---------------------------------------------------------------------------------------------
-// fetch (v2 and v0 share the pack-building core)
-// ---------------------------------------------------------------------------------------------
-
-// FetchArgs are the parsed arguments of a fetch request.
-type FetchArgs struct {
-	Wants   []string
-	Haves   []string
-	Shallow []string
-	Depth   *int
-}
-
-// parseFetchV2 parses the arguments of a v2 fetch request (header lines ignored by prefix).
-func parseFetchV2(lines []string) FetchArgs {
-	args := FetchArgs{}
-	for _, line := range lines {
-		text := strings.TrimSuffix(line, "\n")
-		switch {
-		case strings.HasPrefix(text, "want "):
-			args.Wants = append(args.Wants, strings.TrimSpace(text[5:]))
-		case strings.HasPrefix(text, "have "):
-			args.Haves = append(args.Haves, strings.TrimSpace(text[5:]))
-		case strings.HasPrefix(text, "shallow "):
-			args.Shallow = append(args.Shallow, strings.TrimSpace(text[8:]))
-		case strings.HasPrefix(text, "deepen "):
-			depth := atoi(strings.TrimSpace(text[7:]))
-			args.Depth = &depth
-		}
-	}
-	return args
-}
-
-// parseFetchV0 parses a v0 fetch request (want/have/shallow/deepen across two flushed sections).
-func parseFetchV0(lines []string) FetchArgs {
-	args := FetchArgs{}
-	for _, line := range lines {
-		text := strings.TrimSuffix(line, "\n")
-		switch {
-		case strings.HasPrefix(text, "want "):
-			fields := strings.Fields(text[5:])
-			if len(fields) > 0 && IsOid(fields[0]) {
-				args.Wants = append(args.Wants, fields[0])
+func fetchV2(s *Store, r *Repo, lines []pkt) []byte {
+	fa := parseFetchV2(lines)
+	var b bytes.Buffer
+	// acknowledgments section (only when the client offered haves)
+	if len(fa.haves) > 0 {
+		b.Write(pktStr("acknowledgments\n"))
+		acked := false
+		for _, h := range fa.haves {
+			if _, ok := r.Objects[h]; ok {
+				// ACK only when the have is an ancestor of a want
+				for _, w := range fa.wants {
+					if isAncestor(r, h, w) {
+						b.Write(pktStr("ACK " + h + "\n"))
+						acked = true
+						break
+					}
+				}
 			}
-		case strings.HasPrefix(text, "have "):
-			args.Haves = append(args.Haves, strings.TrimSpace(text[5:]))
-		case strings.HasPrefix(text, "shallow "):
-			args.Shallow = append(args.Shallow, strings.TrimSpace(text[8:]))
-		case strings.HasPrefix(text, "deepen "):
-			depth := atoi(strings.TrimSpace(text[7:]))
-			args.Depth = &depth
 		}
+		if !acked {
+			b.Write(pktStr("NAK\n"))
+		}
+		b.Write(pktDelim)
 	}
-	return args
+	// shallow-info section
+	depth := fa.depth
+	if depth >= 0 {
+		b.Write(pktStr("shallow-info\n"))
+		// boundary oids are computed by buildPackFor below; emit after.
+	}
+	pack, shallow, wantSet := fetchPack(r, fa.wants, fa.haves, depth, fa.shallow)
+	if depth >= 0 {
+		for _, sh := range shallow {
+			b.Write(pktStr("shallow " + sh + "\n"))
+		}
+		shallowSet := make(map[string]bool, len(shallow))
+		for _, sh := range shallow {
+			shallowSet[sh] = true
+		}
+		for _, old := range fa.shallow {
+			// unshallow only when the old boundary is now fully included:
+			// in the pack and no longer a boundary.
+			if wantSet[old] && !shallowSet[old] {
+				b.Write(pktStr("unshallow " + old + "\n"))
+			}
+		}
+		b.Write(pktDelim)
+	}
+	// packfile section
+	b.Write(pktStr("packfile\n"))
+	writePackSideband(&b, pack)
+	b.Write(pktFlush)
+	return b.Bytes()
 }
 
-// sidebandPack splits pack bytes into sideband band-1 packets (each well under the
-// pkt-line max).
-func sidebandPack(pack []byte) []byte {
-	var parts [][]byte
-	const chunk = 32768
-	for at := 0; at < len(pack); at += chunk {
-		end := at + chunk
-		if end > len(pack) {
-			end = len(pack)
+// fetchPack builds (or serves from cache) the pack for a fetch. The clone
+// workload fires 50 concurrent identical fetches; the pack for a tip is
+// built once and cached under the repo's pack version, so the concurrent
+// clones all serve the same bytes with zero rebuild.
+func fetchPack(r *Repo, wants, haves []string, depth int, clientShallow []string) ([]byte, []string, map[string]bool) {
+	if len(haves) == 0 && len(wants) > 0 {
+		key := packCacheKey(wants, depth, 0)
+		r.packMu.Lock()
+		if r.packKey == key && r.packData != nil && r.packCached == r.packVer {
+			pack, shallow, wantSet := r.packData, r.packShallow, r.packWant
+			r.packMu.Unlock()
+			return pack, shallow, wantSet
 		}
-		piece := pack[at:end]
-		framed, _ := FramePkt(append([]byte{1}, piece...))
-		parts = append(parts, framed)
+		ver := r.packVer
+		r.packMu.Unlock()
+		pack, shallow, wantSet := buildPackFor(r, wants, haves, depth, nil)
+		r.packMu.Lock()
+		r.packKey = key
+		r.packData = pack
+		r.packShallow = shallow
+		r.packWant = wantSet
+		r.packCached = ver
+		r.packMu.Unlock()
+		return pack, shallow, wantSet
 	}
-	if len(parts) == 0 {
-		framed, _ := FramePkt(append([]byte{1}, pack...))
-		parts = append(parts, framed)
-	}
-	return bytes.Join(parts, nil)
+	return buildPackFor(r, wants, haves, depth, clientShallow)
 }
 
-// buildFetchPack returns the pack a fetch delivers, with the shallow bookkeeping for
-// depth requests.
-func buildFetchPack(forge *Forge, repo *Repo, args FetchArgs) (pack []byte, shallow []string, unshallow []string, err error) {
-	if args.Depth != nil && *args.Depth > 0 {
-		result := forge.ShallowObjects(repo, args.Wants, args.Haves, args.Shallow, *args.Depth)
-		objects := make([]GitObj, 0, len(result.Objects))
-		for _, object := range result.Objects {
-			objects = append(objects, object)
+// writePackSideband writes pack bytes as sideband band-1 pkt-lines.
+func writePackSideband(b *bytes.Buffer, pack []byte) {
+	const maxData = 65520 - 4 - 1
+	for len(pack) > 0 {
+		n := len(pack)
+		if n > maxData {
+			n = maxData
 		}
-		pack, err = WritePack(objects)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		return pack, result.Shallow, result.Unshallow, nil
+		b.Write(pktSideband(pack[:n]))
+		pack = pack[n:]
 	}
-	// A plain fetch: the closure of the wants, minus the closure of the haves.
-	wanted := make(map[string]bool)
-	for _, want := range args.Wants {
-		if !IsOid(want) {
+}
+
+// --- upload-pack v0 -----------------------------------------------------------
+
+func handleUploadPackV0(s *Store, r *Repo, body []byte) []byte {
+	lines := parsePktLines(body)
+	// two sections: wants (with shallow/deepen), flush, haves + done, flush
+	var wants, haves, shallow []string
+	depth := -1
+	section := 0
+	for _, p := range lines {
+		if p.kind == "flush" {
+			section++
 			continue
 		}
-		if _, ok := repo.Objects[want]; !ok {
+		if p.kind != "data" {
 			continue
 		}
-		wanted[want] = true
-	}
-	wantList := make([]string, 0, len(wanted))
-	for want := range wanted {
-		wantList = append(wantList, want)
-	}
-	objects := forge.FreshObjects(repo, wantList, args.Haves)
-	list := make([]GitObj, 0, len(objects))
-	for _, object := range objects {
-		list = append(list, object)
-	}
-	pack, err = WritePack(list)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return pack, nil, nil, nil
-}
-
-// cacheKeyPart renders one fetch argument list for a cache key: empty for none, the
-// single value as-is, and a sorted comma-join only when there are several (sorting
-// a 0- or 1-element list is a no-op, so the common fetch skips the copy+sort).
-func cacheKeyPart(values []string) string {
-	switch len(values) {
-	case 0:
-		return ""
-	case 1:
-		return values[0]
-	default:
-		sorted := append([]string{}, values...)
-		sort.Strings(sorted)
-		return strings.Join(sorted, ",")
-	}
-}
-
-// fetchCacheKey is the cache key for a fetch answer: the repo's git generation plus
-// every argument that shapes it.
-func fetchCacheKey(repo *Repo, version int, args FetchArgs) string {
-	depth := ""
-	if args.Depth != nil {
-		depth = itoa(*args.Depth)
-	}
-	return "fetch" + itoa(version) + ":" + itoa(int(repo.GitGen)) + ":" +
-		cacheKeyPart(args.Wants) + "|" + cacheKeyPart(args.Haves) + "|" + cacheKeyPart(args.Shallow) + "|" + depth
-}
-
-// fetchV2Answer returns the v2 fetch answer: acknowledgments, shallow-info, packfile sections.
-func fetchV2Answer(forge *Forge, repo *Repo, args FetchArgs) []byte {
-	key := fetchCacheKey(repo, 2, args)
-	if cached := gitCacheGet(repo, key); cached != nil {
-		return cached
-	}
-	pack, shallow, unshallow, err := buildFetchPack(forge, repo, args)
-	if err != nil {
-		return nil
-	}
-	var parts [][]byte
-	ack, _ := FramePktString("acknowledgments\n")
-	parts = append(parts, ack)
-	var held []string
-	for _, have := range args.Haves {
-		if _, ok := repo.Objects[have]; ok {
-			held = append(held, have)
-		}
-	}
-	if len(held) == 0 {
-		nak, _ := FramePktString("NAK\n")
-		parts = append(parts, nak)
-	} else {
-		for _, have := range held {
-			line, _ := FramePktString("ACK " + have + "\n")
-			parts = append(parts, line)
-		}
-		ready, _ := FramePktString("ready\n")
-		parts = append(parts, ready)
-	}
-	parts = append(parts, FrameDelim())
-	if len(shallow) > 0 || len(unshallow) > 0 {
-		header, _ := FramePktString("shallow-info\n")
-		parts = append(parts, header)
-		for _, oid := range shallow {
-			line, _ := FramePktString("shallow " + oid + "\n")
-			parts = append(parts, line)
-		}
-		for _, oid := range unshallow {
-			line, _ := FramePktString("unshallow " + oid + "\n")
-			parts = append(parts, line)
-		}
-		parts = append(parts, FrameDelim())
-	}
-	packHeader, _ := FramePktString("packfile\n")
-	parts = append(parts, packHeader)
-	parts = append(parts, sidebandPack(pack))
-	parts = append(parts, FrameFlush())
-	built := bytes.Join(parts, nil)
-	gitCachePut(repo, key, built)
-	return built
-}
-
-// fetchV0Answer returns the v0 fetch answer: NAK/ACK/shallow lines, then the sideband pack.
-func fetchV0Answer(forge *Forge, repo *Repo, args FetchArgs) []byte {
-	key := fetchCacheKey(repo, 0, args)
-	if cached := gitCacheGet(repo, key); cached != nil {
-		return cached
-	}
-	pack, shallow, unshallow, err := buildFetchPack(forge, repo, args)
-	if err != nil {
-		return nil
-	}
-	var parts [][]byte
-	var held []string
-	for _, have := range args.Haves {
-		if _, ok := repo.Objects[have]; ok {
-			held = append(held, have)
-		}
-	}
-	if len(held) == 0 {
-		nak, _ := FramePktString("NAK\n")
-		parts = append(parts, nak)
-	} else {
-		for _, have := range held {
-			line, _ := FramePktString("ACK " + have + "\n")
-			parts = append(parts, line)
-		}
-	}
-	for _, oid := range shallow {
-		line, _ := FramePktString("shallow " + oid + "\n")
-		parts = append(parts, line)
-	}
-	for _, oid := range unshallow {
-		line, _ := FramePktString("unshallow " + oid + "\n")
-		parts = append(parts, line)
-	}
-	parts = append(parts, sidebandPack(pack))
-	parts = append(parts, FrameFlush())
-	built := bytes.Join(parts, nil)
-	gitCachePut(repo, key, built)
-	return built
-}
-
-// ---------------------------------------------------------------------------------------------
-// upload-pack POST (ls-refs / fetch) and receive-pack POST (push)
-// ---------------------------------------------------------------------------------------------
-
-// UploadPack answers POST /{owner}/{repo}.git/git-upload-pack. The first line selects
-// the shape: a v2 `command=ls-refs` or `command=fetch` request, or a v0 want/have request.
-func UploadPack(forge *Forge, owner string, repoName string, body []byte) GitHTTPResult {
-	if owner != ViewerLogin {
-		return gitFail(404, "Not Found")
-	}
-	repo := forge.GetRepo(repoName)
-	if repo == nil {
-		return gitFail(404, "Not Found")
-	}
-	packets, _, err := DecodePkts(body, false)
-	if err != nil {
-		return gitFail(400, "malformed pkt-line stream")
-	}
-	lines := PktLines(packets)
-	first := ""
-	if len(lines) > 0 {
-		first = strings.TrimSuffix(lines[0], "\n")
-	}
-	if first == "command=ls-refs" {
-		return gitOK(uploadResult, lsRefsAnswer(forge, repo, parseLsRefs(lines)))
-	}
-	if first == "command=fetch" {
-		return gitOK(uploadResult, fetchV2Answer(forge, repo, parseFetchV2(lines)))
-	}
-	// v0: want/have/shallow/deepen lines in two flushed sections.
-	return gitOK(uploadResult, fetchV0Answer(forge, repo, parseFetchV0(lines)))
-}
-
-// PushCommand is one receive-pack ref update.
-type PushCommand struct {
-	OldOid string
-	NewOid string
-	Ref    string
-}
-
-// ReceivePack answers POST /{owner}/{repo}.git/git-receive-pack. A pkt-framed command
-// list, a flush, then the raw pack bytes. Each command is validated (old tip matches,
-// new tip fast-forwards) and the report answers one ok/ng line per ref, inside
-// sideband band 1.
-func ReceivePack(forge *Forge, owner string, repoName string, body []byte) GitHTTPResult {
-	if owner != ViewerLogin {
-		return gitFail(404, "Not Found")
-	}
-	repo := forge.GetRepo(repoName)
-	if repo == nil {
-		return gitFail(404, "Not Found")
-	}
-	packets, tail, err := DecodePkts(body, true)
-	if err != nil {
-		return gitFail(400, "malformed pkt-line stream")
-	}
-	var commands []PushCommand
-	for _, packet := range packets {
-		if packet.Kind != PktData {
-			continue
-		}
-		text := strings.TrimSuffix(string(packet.Payload), "\n")
+		text := strings.TrimSuffix(p.text, "\n")
+		// first want line may carry capabilities after NUL
 		if nul := strings.IndexByte(text, 0); nul >= 0 {
 			text = text[:nul]
 		}
-		parts := strings.Split(text, " ")
-		if len(parts) < 3 || !IsOid(parts[0]) || !IsOid(parts[1]) {
+		switch {
+		case strings.HasPrefix(text, "want "):
+			wants = append(wants, text[5:])
+		case strings.HasPrefix(text, "have "):
+			haves = append(haves, text[5:])
+		case strings.HasPrefix(text, "shallow "):
+			shallow = append(shallow, text[8:])
+		case strings.HasPrefix(text, "deepen "):
+			n, _ := strconv.Atoi(text[7:])
+			depth = n
+		}
+		_ = section
+	}
+	var b bytes.Buffer
+	// NAK / ACK lines (plain pkt-lines, not sideband)
+	if len(haves) > 0 {
+		acked := false
+		for _, h := range haves {
+			if _, ok := r.Objects[h]; ok {
+				for _, w := range wants {
+					if isAncestor(r, h, w) {
+						b.Write(pktStr("ACK " + h + "\n"))
+						acked = true
+						break
+					}
+				}
+			}
+		}
+		if !acked {
+			b.Write(pktStr("NAK\n"))
+		}
+	}
+	pack, sh, wantSet := fetchPack(r, wants, haves, depth, shallow)
+	if depth >= 0 {
+		for _, s := range sh {
+			b.Write(pktStr("shallow " + s + "\n"))
+		}
+		shallowSet := make(map[string]bool, len(sh))
+		for _, s := range sh {
+			shallowSet[s] = true
+		}
+		for _, old := range shallow {
+			if wantSet[old] && !shallowSet[old] {
+				b.Write(pktStr("unshallow " + old + "\n"))
+			}
+		}
+	}
+	writePackSideband(&b, pack)
+	b.Write(pktFlush)
+	return b.Bytes()
+}
+
+// --- receive-pack -------------------------------------------------------------
+
+// handleReceivePack serves POST /git-receive-pack. Returns the sideband
+// report body. The caller holds the store write lock.
+func handleReceivePack(s *Store, r *Repo, body []byte) []byte {
+	lines := parsePktLines(body)
+	type cmd struct {
+		oldOID, newOID, ref string
+	}
+	var cmds []cmd
+	packStart := -1
+	for i, p := range lines {
+		if p.kind == "flush" {
+			packStart = i
+			break
+		}
+		if p.kind != "data" {
 			continue
 		}
-		commands = append(commands, PushCommand{OldOid: parts[0], NewOid: parts[1], Ref: parts[2]})
+		text := strings.TrimSuffix(p.text, "\n")
+		if nul := strings.IndexByte(text, 0); nul >= 0 {
+			text = text[:nul]
+		}
+		parts := strings.SplitN(text, " ", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		cmds = append(cmds, cmd{oldOID: parts[0], newOID: parts[1], ref: parts[2]})
 	}
-	if len(commands) == 0 {
-		return gitFail(400, "no push commands")
-	}
-
-	// Unpack first: the pack's objects land in the store even when a ref is refused.
-	unpackOK := true
-	unpackDetail := "ok"
-	if len(tail) > 0 {
-		read, err := ReadPack(tail, func(oid string) *GitObj {
-			if obj, ok := repo.Objects[oid]; ok {
-				return &obj
+	// pack bytes follow the flush pkt-line in the raw body
+	var pack []byte
+	if packStart >= 0 {
+		// recompute byte offset of the flush packet
+		off := 0
+		for i := 0; i <= packStart; i++ {
+			n, err := strconv.ParseInt(string(body[off:off+4]), 16, 32)
+			if err != nil {
+				break
 			}
-			return nil
-		})
+			if n == 0 {
+				off += 4
+			} else {
+				off += int(n)
+			}
+		}
+		if off < len(body) {
+			pack = body[off:]
+		}
+	}
+	// ingest objects
+	unpackOK := true
+	if len(pack) > 0 {
+		objs, err := readPackFull(pack, func(oid string) *Object { return r.Objects[oid] })
 		if err != nil {
 			unpackOK = false
-			unpackDetail = err.Error()
 		} else {
-			stored := false
-			for oid, object := range read.Objects {
-				if _, ok := repo.Objects[oid]; !ok {
-					repo.Objects[oid] = object
-					stored = true
+			for oid, o := range objs {
+				if _, ok := r.Objects[oid]; !ok {
+					r.Objects[oid] = o
 				}
-			}
-			if stored {
-				forge.TouchGit(repo)
 			}
 		}
 	}
-
-	unpackLine := "unpack ok\n"
-	if !unpackOK {
-		unpackLine = "unpack " + unpackDetail + "\n"
+	// apply commands
+	var report bytes.Buffer
+	if unpackOK {
+		report.WriteString("unpack ok\n")
+	} else {
+		report.WriteString("unpack error\n")
 	}
-	reportLines := []string{unpackLine}
-	for _, command := range commands {
-		var verdictOK bool
-		var verdictReason string
-		decided := false
-		switch {
-		case !strings.HasPrefix(command.Ref, "refs/"):
-			verdictOK, verdictReason, decided = false, "invalid ref", true
-		case !unpackOK:
-			verdictOK, verdictReason, decided = false, "unpack failed", true
-		}
-		if !decided {
-			current, hasCurrent := repo.Refs[command.Ref]
-			if command.NewOid == ZERO_OID {
-				// A delete: the old tip must match.
-				if !hasCurrent {
-					verdictOK, verdictReason = false, "non-fast-forward"
-				} else if current != command.OldOid {
-					verdictOK, verdictReason = false, "non-fast-forward"
-				} else {
-					verdictOK = true
-				}
+	for _, c := range cmds {
+		ok := false
+		reason := ""
+		if !unpackOK {
+			reason = "unpacker error"
+		} else if c.newOID == zeroOID {
+			// delete
+			cur, exists := r.Refs[c.ref]
+			if !exists {
+				reason = "remote ref does not exist"
+			} else if c.oldOID != zeroOID && cur != c.oldOID {
+				reason = "non-fast-forward"
 			} else {
-				target, hasTarget := repo.Objects[command.NewOid]
-				switch {
-				case !hasTarget || (target.Kind != KindCommit && target.Kind != KindTag):
-					verdictOK, verdictReason = false, "object not found"
-				case !hasCurrent:
-					if command.OldOid == ZERO_OID {
-						verdictOK = true
+				delete(r.Refs, c.ref)
+				ok = true
+			}
+		} else {
+			// create or update: the new object must exist
+			if _, exists := r.Objects[c.newOID]; !exists {
+				reason = "object not found"
+			} else {
+				cur, exists := r.Refs[c.ref]
+				if !exists {
+					if c.oldOID != zeroOID {
+						reason = "non-fast-forward"
 					} else {
-						verdictOK, verdictReason = false, "non-fast-forward"
+						r.Refs[c.ref] = c.newOID
+						ok = true
 					}
-				case command.OldOid == ZERO_OID:
-					verdictOK, verdictReason = false, "already exists"
-				case current != command.OldOid:
-					verdictOK, verdictReason = false, "non-fast-forward"
-				case !forge.IsFastForward(repo, command.OldOid, command.NewOid):
-					verdictOK, verdictReason = false, "non-fast-forward"
-				default:
-					verdictOK = true
+				} else if cur != c.oldOID {
+					reason = "non-fast-forward"
+				} else if !isAncestor(r, cur, c.newOID) {
+					reason = "non-fast-forward"
+				} else {
+					r.Refs[c.ref] = c.newOID
+					ok = true
 				}
 			}
 		}
-		if verdictOK {
-			if command.NewOid == ZERO_OID {
-				delete(repo.Refs, command.Ref)
-			} else {
-				repo.Refs[command.Ref] = command.NewOid
-			}
-			forge.TouchGit(repo)
-			reportLines = append(reportLines, "ok "+command.Ref+"\n")
+		if ok {
+			report.WriteString("ok " + c.ref + "\n")
 		} else {
-			reason := verdictReason
-			if reason == "" {
-				reason = "failed"
-			}
-			reportLines = append(reportLines, "ng "+command.Ref+" "+reason+"\n")
+			report.WriteString("ng " + c.ref + " " + reason + "\n")
 		}
 	}
-
-	reportBody := mustFramePktStrings(reportLines)
-	sideband, _ := FramePkt(append([]byte{1}, reportBody...))
-	return gitOK(receiveResult, append(append([]byte{}, sideband...), FrameFlush()...))
+	if len(cmds) > 0 {
+		r.packVer++
+	}
+	// frame the report as sideband band-1 pkt-lines
+	var out bytes.Buffer
+	// split the report into pkt-lines (each line its own packet)
+	for _, line := range strings.SplitAfter(report.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		out.Write(pktSideband([]byte(line)))
+	}
+	out.Write(pktFlush)
+	return out.Bytes()
 }
 
-func itoa(v int) string {
-	return strconv.Itoa(v)
-}
-
-func atoi(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
+// sha1Hex is a small helper kept here for pack checksums.
+func sha1Hex(b []byte) string {
+	sum := sha1.Sum(b)
+	return hex.EncodeToString(sum[:])
 }

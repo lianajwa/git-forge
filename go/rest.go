@@ -1,1029 +1,1500 @@
-// rest.go — GitHub REST v3: repositories, branches, commits, contents, labels,
-// issues, comments, pull requests and merges, plus the wire-protocol rules every
-// reply obeys (application/json, a non-empty X-GitHub-Request-Id, `{message}` error
-// bodies). All state lives in the shared Forge store, so REST sees what git, GraphQL
-// and MCP wrote.
-
+// REST v3: /api/v3 — repositories, issues, pull requests, contents.
+//
+// Shapes follow the kit's rest-client expectations: every reply is
+// application/json with a non-empty X-GitHub-Request-Id (added by the HTTP
+// layer), errors are {"message": string}, unknown routes are JSON 404 and a
+// malformed JSON body is a 400. The token's owner is always `adaiversen`
+// (see store.go); any other owner segment answers 404, never 403.
 package main
 
 import (
 	"encoding/base64"
-	"net/url"
 	"strconv"
 	"strings"
 )
 
-// RestResult is one REST answer.
-type RestResult struct {
-	Status  int
-	Body    any // nil means no body (204)
-	RawBody []byte
-	Headers map[string]string
+func errJSON(msg string) []byte {
+	bp := getBuf()
+	b := *bp
+	b = append(b, `{"message":`...)
+	b = jsonEscape(b, msg)
+	b = append(b, '}')
+	out := make([]byte, len(b))
+	copy(out, b)
+	putBuf(bp)
+	return out
 }
 
-func restOK(body any, status int, headers map[string]string) RestResult {
-	return RestResult{Status: status, Body: body, Headers: headers}
+func (s *server) restError(res *response, status int, msg string) {
+	res.status = status
+	res.body = errJSON(msg)
 }
 
-// restOKRaw is a 200/201 whose body is already JSON bytes (the cached issue JSON).
-func restOKRaw(rawBody []byte, status int, headers map[string]string) RestResult {
-	return RestResult{Status: status, RawBody: rawBody, Headers: headers}
-}
-
-func restErr(status int, message string) RestResult {
-	return RestResult{Status: status, Body: struct {
-		Message string `json:"message"`
-	}{Message: message}}
-}
-
-func restNotFound(what string) RestResult {
-	if what == "" {
-		what = "Not Found"
+// queryParams parses req.query into a map.
+func queryParams(q string) map[string]string {
+	out := map[string]string{}
+	for q != "" {
+		kv := q
+		if i := strings.IndexByte(q, '&'); i >= 0 {
+			kv, q = q[:i], q[i+1:]
+		} else {
+			q = ""
+		}
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			out[kv[:i]] = urlUnescape(kv[i+1:])
+		} else if kv != "" {
+			out[kv] = ""
+		}
 	}
-	return restErr(404, what)
+	return out
 }
 
-// bodyObject returns the JSON object body, or nil when the body is not an object.
-func bodyObject(body any, parseErr bool) map[string]any {
-	if parseErr {
+func urlUnescape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '%' && i+2 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 2
+				continue
+			}
+		}
+		if c == '+' {
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// splitRest splits a /api/v3 path into segments (unescaped, '/' inside a
+// contents path kept as one trailing segment is handled by callers).
+func splitRest(path string) []string {
+	path = strings.TrimPrefix(path, "/api/v3")
+	path = strings.Trim(path, "/")
+	if path == "" {
 		return nil
 	}
-	if obj, ok := body.(map[string]any); ok {
-		return obj
+	parts := strings.Split(path, "/")
+	for i, p := range parts {
+		parts[i] = urlUnescape(p)
 	}
-	return nil
+	return parts
 }
 
-func bodyString(body map[string]any, key string) (string, bool) {
-	if body == nil {
+// auth: a non-empty Bearer token is required for every /api/v3 route.
+func (s *server) requireAuth(req *request, res *response) bool {
+	auth := req.headerString("authorization")
+	if !strings.HasPrefix(auth, "Bearer ") || len(strings.TrimSpace(auth[7:])) == 0 {
+		s.restError(res, 401, "Requires authentication")
+		return false
+	}
+	return true
+}
+
+// getRepo resolves owner/name under the store read lock. Returns nil when
+// the owner is foreign or the repo does not exist.
+func (s *server) getRepo(owner, name string) *Repo {
+	if owner != ownerLogin {
+		return nil
+	}
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+	return s.store.repos[name]
+}
+
+// --- repository helpers -------------------------------------------------------
+
+func (s *server) createRepoFrom(name, desc string, priv bool) (*Repo, bool) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if _, ok := s.store.repos[name]; ok {
+		return nil, false
+	}
+	s.store.nextID++
+	r := &Repo{
+		Name:          name,
+		Description:   desc,
+		Private:       priv,
+		DefaultBranch: "main",
+		ID:            s.store.nextID,
+		Refs:          make(map[string]string),
+		Objects:       make(map[string]*Object),
+		IssueByNum:    make(map[int]*Issue),
+		Labels:        make(map[string]*Label),
+		PullByNum:     make(map[int]*Pull),
+		NextIssue:     1,
+		NextPull:      1,
+		NextComment:   1,
+	}
+	r.GlobalID = "R_" + strconv.Itoa(r.ID)
+	r.Seq = s.store.nextSeq()
+	s.store.repos[name] = r
+	s.store.cacheRepo(r)
+	return r, true
+}
+
+// makeCommit builds a commit object (author fixed) and stores it.
+func (s *server) makeCommit(r *Repo, treeOID string, parents []string, message string) string {
+	var b strings.Builder
+	b.WriteString("tree " + treeOID + "\n")
+	for _, p := range parents {
+		b.WriteString("parent " + p + "\n")
+	}
+	b.WriteString("author adaiversen <adaiversen@example.invalid> 1700000000 +0000\n")
+	b.WriteString("committer adaiversen <adaiversen@example.invalid> 1700000000 +0000\n")
+	b.WriteString("\n")
+	b.WriteString(message)
+	data := []byte(b.String())
+	oid := hashObject("commit", data)
+	if _, ok := r.Objects[oid]; !ok {
+		r.Objects[oid] = &Object{Type: "commit", Data: data}
+	}
+	return oid
+}
+
+// commitFile creates/updates a file on a branch: new blob, new tree, new
+// commit, ref update. Returns the commit oid and blob oid.
+func (s *server) commitFile(r *Repo, branch, path string, content []byte, message string) (string, string) {
+	blobOID := hashObject("blob", content)
+	if _, ok := r.Objects[blobOID]; !ok {
+		r.Objects[blobOID] = &Object{Type: "blob", Data: content}
+	}
+	refName := "refs/heads/" + branch
+	tip, hasTip := r.Refs[refName]
+	var baseTree string
+	var parents []string
+	if hasTip {
+		if obj := r.Objects[tip]; obj != nil && obj.Type == "commit" {
+			baseTree = parseCommit(obj.Data).Tree
+			parents = []string{tip}
+		}
+	}
+	newTree := updateTree(r, baseTree, splitPath(path), blobOID, "100644")
+	commitOID := s.makeCommit(r, newTree, parents, message)
+	r.Refs[refName] = commitOID
+	r.packVer++
+	return commitOID, blobOID
+}
+
+// deleteFile removes a file from a branch.
+func (s *server) deleteFile(r *Repo, branch, path, message string) (string, bool) {
+	refName := "refs/heads/" + branch
+	tip, hasTip := r.Refs[refName]
+	if !hasTip {
 		return "", false
 	}
-	value, ok := body[key].(string)
-	return value, ok
-}
-
-func bodyBoolean(body map[string]any, key string) (bool, bool) {
-	if body == nil {
-		return false, false
+	obj := r.Objects[tip]
+	if obj == nil || obj.Type != "commit" {
+		return "", false
 	}
-	value, ok := body[key].(bool)
-	return value, ok
-}
-
-// ---------------------------------------------------------------------------------------------
-// JSON views (struct field order matches the Node object literals)
-// ---------------------------------------------------------------------------------------------
-
-type userRef struct {
-	Login string `json:"login"`
-	ID    int    `json:"id"`
-	Type  string `json:"type"`
-}
-
-type repoView struct {
-	ID              int64   `json:"id"`
-	NodeID          string  `json:"node_id"`
-	Name            string  `json:"name"`
-	FullName        string  `json:"full_name"`
-	Owner           userRef `json:"owner"`
-	Private         bool    `json:"private"`
-	Description     string  `json:"description"`
-	DefaultBranch   string  `json:"default_branch"`
-	CreatedAt       string  `json:"created_at"`
-	UpdatedAt       string  `json:"updated_at"`
-	HasIssues       bool    `json:"has_issues"`
-	HasPullRequests bool    `json:"has_pull_requests"`
-	URL             string  `json:"url"`
-	HTMLURL         string  `json:"html_url"`
-}
-
-// RepoJSON renders a repository the way the API does.
-func RepoJSON(repo *Repo) repoView {
-	return repoView{
-		ID:              repo.DatabaseID,
-		NodeID:          "R_" + strconv.FormatInt(repo.DatabaseID, 10),
-		Name:            repo.Name,
-		FullName:        ViewerLogin + "/" + repo.Name,
-		Owner:           userRef{Login: ViewerLogin, ID: 1000, Type: "User"},
-		Private:         repo.IsPrivate,
-		Description:     repo.Description,
-		DefaultBranch:   DefaultBranch,
-		CreatedAt:       repo.CreatedAt,
-		UpdatedAt:       repo.CreatedAt,
-		HasIssues:       true,
-		HasPullRequests: true,
-		URL:             "/api/v3/repos/" + ViewerLogin + "/" + repo.Name,
-		HTMLURL:         "https://github.com/" + ViewerLogin + "/" + repo.Name,
+	baseTree := parseCommit(obj.Data).Tree
+	if _, data := lookupBlob(r, baseTree, path); data == nil {
+		return "", false
 	}
+	newTree := updateTree(r, baseTree, splitPath(path), "", "100644")
+	commitOID := s.makeCommit(r, newTree, []string{tip}, message)
+	r.Refs[refName] = commitOID
+	r.packVer++
+	return commitOID, true
 }
 
-type issueLabelView struct {
-	ID    *int64 `json:"id"`
-	Name  string `json:"name"`
-	Color string `json:"color"`
-}
-
-type issueView struct {
-	ID        int64            `json:"id"`
-	NodeID    string           `json:"node_id"`
-	Number    int              `json:"number"`
-	Title     string           `json:"title"`
-	Body      string           `json:"body"`
-	State     string           `json:"state"`
-	Labels    []issueLabelView `json:"labels"`
-	User      userRef          `json:"user"`
-	CreatedAt string           `json:"created_at"`
-	UpdatedAt string           `json:"updated_at"`
-	URL       string           `json:"url"`
-	HTMLURL   string           `json:"html_url"`
-}
-
-// IssueJSON renders an issue the way the API does.
-func IssueJSON(repo *Repo, issue *Issue) issueView {
-	labels := make([]issueLabelView, 0, len(issue.Labels))
-	for _, name := range issue.Labels {
-		color := "ededed"
-		if label, ok := repo.Labels[name]; ok {
-			color = label.Color
+// treeAt resolves a ref (branch name, full ref, or oid) to a tree oid.
+func (r *Repo) treeAt(ref string) string {
+	var tip string
+	if ref == "" {
+		tip, _ = r.Refs["refs/heads/"+r.DefaultBranch]
+	} else if oid, ok := r.Refs["refs/heads/"+ref]; ok {
+		tip = oid
+	} else if oid, ok := r.Refs[ref]; ok {
+		tip = oid
+	} else if isOID(ref) {
+		tip = ref
+	} else {
+		return ""
+	}
+	obj := r.Objects[tip]
+	if obj == nil {
+		return ""
+	}
+	if obj.Type == "commit" {
+		return parseCommit(obj.Data).Tree
+	}
+	if obj.Type == "tag" {
+		target, _ := parseTag(obj.Data)
+		if to := r.Objects[target]; to != nil && to.Type == "commit" {
+			return parseCommit(to.Data).Tree
 		}
-		labels = append(labels, issueLabelView{ID: nil, Name: name, Color: color})
 	}
-	return issueView{
-		ID:        issue.ID,
-		NodeID:    "I_" + strconv.FormatInt(issue.ID, 10),
-		Number:    issue.Number,
-		Title:     issue.Title,
-		Body:      issue.Body,
-		State:     issue.State,
-		Labels:    labels,
-		User:      userRef{Login: ViewerLogin, ID: 1000, Type: "User"},
-		CreatedAt: issue.CreatedAt,
-		UpdatedAt: issue.CreatedAt,
-		URL:       "/api/v3/repos/" + ViewerLogin + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
-		HTMLURL:   "https://github.com/" + ViewerLogin + "/" + repo.Name + "/issues/" + strconv.Itoa(issue.Number),
-	}
+	return ""
 }
 
-// IssueJSONText returns the serialized issue JSON bytes, cached on the repo. An issue's
-// JSON is a pure function of the issue and its labels, and labels never change after
-// creation while an issue's title, body and state change only through the PATCH route
-// (and GraphQL's closeIssue), which both drop the cached entry — so a hit is
-// byte-identical to a fresh build. The returned bytes are the cache's own: callers
-// must never mutate them (the writer only reads them).
-func IssueJSONText(repo *Repo, issue *Issue) []byte {
-	repo.cacheMu.Lock()
-	defer repo.cacheMu.Unlock()
-	if cached, ok := repo.issueJsonCache[issue.Number]; ok {
-		return cached
+// --- issue / pull helpers ------------------------------------------------------
+
+func (s *server) createIssueIn(r *Repo, title, body string, labels []string) (*Issue, string) {
+	for _, ln := range labels {
+		if _, ok := r.Labels[ln]; !ok {
+			return nil, ln
+		}
 	}
-	built := mustJSON(IssueJSON(repo, issue))
-	repo.issueJsonCache[issue.Number] = built
-	return built
+	is := &Issue{
+		Number: r.NextIssue,
+		Title:  title,
+		Body:   body,
+		State:  "open",
+		Labels: append([]string{}, labels...),
+		Seq:    s.store.nextSeq(),
+	}
+	r.NextIssue++
+	r.Issues = append(r.Issues, is)
+	r.IssueByNum[is.Number] = is
+	s.store.cacheIssue(r, is)
+	return is, ""
 }
 
-// DropIssueJSONCache drops one issue's cached JSON after a mutation (PATCH, GraphQL
-// closeIssue).
-func DropIssueJSONCache(repo *Repo, issueNumber int) {
-	repo.cacheMu.Lock()
-	defer repo.cacheMu.Unlock()
-	delete(repo.issueJsonCache, issueNumber)
+// pullConflict reports whether merging head into base would conflict:
+// the same path changed on both sides of the merge-base with different
+// resulting blobs.
+func (s *server) pullConflict(r *Repo, pr *Pull) bool {
+	headTip, _ := r.Refs["refs/heads/"+pr.HeadRef]
+	baseTip, _ := r.Refs["refs/heads/"+pr.BaseRef]
+	if headTip == "" || baseTip == "" {
+		return false
+	}
+	mb := mergeBase(r, headTip, baseTip)
+	if mb == "" {
+		return false
+	}
+	mbTree := ""
+	if obj := r.Objects[mb]; obj != nil && obj.Type == "commit" {
+		mbTree = parseCommit(obj.Data).Tree
+	}
+	headTree := ""
+	if obj := r.Objects[headTip]; obj != nil && obj.Type == "commit" {
+		headTree = parseCommit(obj.Data).Tree
+	}
+	baseTree := ""
+	if obj := r.Objects[baseTip]; obj != nil && obj.Type == "commit" {
+		baseTree = parseCommit(obj.Data).Tree
+	}
+	baseDiff := diffTrees(r, mbTree, baseTree)
+	headDiff := diffTrees(r, mbTree, headTree)
+	headFlat := treeFlat(r, headTree)
+	baseFlat := treeFlat(r, baseTree)
+	for p := range baseDiff {
+		if _, ok := headDiff[p]; ok {
+			he, hok := headFlat[p]
+			be, bok := baseFlat[p]
+			if hok && bok && he.OID != be.OID {
+				return true
+			}
+			if hok != bok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-type pullRefView struct {
-	Ref   string `json:"ref"`
-	Sha   string `json:"sha"`
-	Label string `json:"label"`
+func (s *server) createPullIn(r *Repo, title, body, head, base string) (*Pull, string) {
+	headTip, ok := r.Refs["refs/heads/"+head]
+	if !ok {
+		return nil, "head branch not found"
+	}
+	baseTip, ok := r.Refs["refs/heads/"+base]
+	if !ok {
+		return nil, "base branch not found"
+	}
+	headTree, baseTree := "", ""
+	if obj := r.Objects[headTip]; obj != nil && obj.Type == "commit" {
+		headTree = parseCommit(obj.Data).Tree
+	}
+	if obj := r.Objects[baseTip]; obj != nil && obj.Type == "commit" {
+		baseTree = parseCommit(obj.Data).Tree
+	}
+	diff := diffTrees(r, baseTree, headTree)
+	paths := make([]string, 0, len(diff))
+	for p := range diff {
+		paths = append(paths, p)
+	}
+	// sort for determinism
+	for i := 0; i < len(paths); i++ {
+		for j := i + 1; j < len(paths); j++ {
+			if paths[j] < paths[i] {
+				paths[i], paths[j] = paths[j], paths[i]
+			}
+		}
+	}
+	pr := &Pull{
+		Number:       r.NextPull,
+		Title:        title,
+		Body:         body,
+		State:        "open",
+		HeadRef:      head,
+		BaseRef:      base,
+		HeadSHA:      headTip,
+		BaseSHA:      baseTip,
+		Seq:          s.store.nextSeq(),
+		ChangedPaths: paths,
+		HeadTree:     headTree,
+		BaseTree:     baseTree,
+	}
+	r.NextPull++
+	pr.mergeConflict = s.pullConflict(r, pr)
+	r.Pulls = append(r.Pulls, pr)
+	r.PullByNum[pr.Number] = pr
+	return pr, ""
 }
 
-type pullView struct {
-	ID             int64       `json:"id"`
-	NodeID         string      `json:"node_id"`
-	Number         int         `json:"number"`
-	State          string      `json:"state"`
-	Title          string      `json:"title"`
-	Body           string      `json:"body"`
-	Head           pullRefView `json:"head"`
-	Base           pullRefView `json:"base"`
-	Merged         bool        `json:"merged"`
-	MergedAt       *string     `json:"merged_at"`
-	MergeCommitSha *string     `json:"merge_commit_sha"`
-	Mergeable      bool        `json:"mergeable"`
-	User           userRef     `json:"user"`
-	CreatedAt      string      `json:"created_at"`
-	UpdatedAt      string      `json:"updated_at"`
-	URL            string      `json:"url"`
-	HTMLURL        string      `json:"html_url"`
+// renderPull builds a PR JSON object.
+func (s *server) renderPull(r *Repo, pr *Pull) []byte {
+	bp := getBuf()
+	b := *bp
+	b = append(b, `{"id":"PR_`...)
+	b = strconv.AppendInt(b, int64(r.ID), 10)
+	b = append(b, '_')
+	b = strconv.AppendInt(b, int64(pr.Number), 10)
+	b = append(b, `","number":`...)
+	b = strconv.AppendInt(b, int64(pr.Number), 10)
+	b = append(b, `,"title":`...)
+	b = jsonEscape(b, pr.Title)
+	b = append(b, `,"body":`...)
+	b = jsonEscape(b, pr.Body)
+	b = append(b, `,"state":"`...)
+	b = append(b, pr.State...)
+	b = append(b, `","head":{"ref":`...)
+	b = jsonEscape(b, pr.HeadRef)
+	b = append(b, `,"sha":`...)
+	b = jsonEscape(b, pr.HeadSHA)
+	b = append(b, `},"base":{"ref":`...)
+	b = jsonEscape(b, pr.BaseRef)
+	b = append(b, `,"sha":`...)
+	b = jsonEscape(b, pr.BaseSHA)
+	b = append(b, `},"merged":`...)
+	if pr.Merged {
+		b = append(b, "true"...)
+	} else {
+		b = append(b, "false"...)
+	}
+	b = append(b, `,"mergeable":`...)
+	if pr.mergeConflict {
+		b = append(b, "false"...)
+	} else {
+		b = append(b, "true"...)
+	}
+	b = append(b, `,"merge_commit_sha":`...)
+	if pr.MergeCommit != "" {
+		b = jsonEscape(b, pr.MergeCommit)
+	} else {
+		b = append(b, "null"...)
+	}
+	b = append(b, `,"merged_at":`...)
+	if pr.MergedAt != "" {
+		b = jsonEscape(b, pr.MergedAt)
+	} else {
+		b = append(b, "null"...)
+	}
+	b = append(b, `,"user":{"login":"`...)
+	b = append(b, ownerLogin...)
+	b = append(b, `"},"html_url":"https://example.invalid/`...)
+	b = append(b, ownerLogin...)
+	b = append(b, '/')
+	b = append(b, r.Name...)
+	b = append(b, `/pull/`...)
+	b = strconv.AppendInt(b, int64(pr.Number), 10)
+	b = append(b, `"}`...)
+	out := make([]byte, len(b))
+	copy(out, b)
+	putBuf(bp)
+	return out
 }
 
-// PullJSON renders a pull request the way the API does.
-func PullJSON(repo *Repo, pull *Pull, forge *Forge) pullView {
-	headSha, _ := forge.BranchTip(repo, pull.Head)
-	return pullView{
-		ID:             pull.ID,
-		NodeID:         "PR_" + strconv.FormatInt(pull.ID, 10),
-		Number:         pull.Number,
-		State:          pull.State,
-		Title:          pull.Title,
-		Body:           pull.Body,
-		Head:           pullRefView{Ref: pull.Head, Sha: headSha, Label: ViewerLogin + ":" + pull.Head},
-		Base:           pullRefView{Ref: pull.Base, Sha: pull.BaseSha, Label: ViewerLogin + ":" + pull.Base},
-		Merged:         pull.Merged,
-		MergedAt:       pull.MergedAt,
-		MergeCommitSha: pull.MergeSha,
-		Mergeable:      !forge.PullConflict(repo, pull),
-		User:           userRef{Login: ViewerLogin, ID: 1000, Type: "User"},
-		CreatedAt:      pull.CreatedAt,
-		UpdatedAt:      pull.CreatedAt,
-		URL:            "/api/v3/repos/" + ViewerLogin + "/" + repo.Name + "/pulls/" + strconv.Itoa(pull.Number),
-		HTMLURL:        "https://github.com/" + ViewerLogin + "/" + repo.Name + "/pull/" + strconv.Itoa(pull.Number),
+// lineDiff counts added/removed lines between two blobs (LCS on lines).
+func lineDiff(oldData, newData []byte) (add, del int) {
+	oldLines := splitLines(oldData)
+	newLines := splitLines(newData)
+	// LCS DP on small files
+	n, m := len(oldLines), len(newLines)
+	if n*m > 1_000_000 {
+		// too big: approximate
+		return m, n
 	}
+	dp := make([][]int, n+1)
+	for i := range dp {
+		dp[i] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] > dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+	common := dp[0][0]
+	return m - common, n - common
 }
 
-// ---------------------------------------------------------------------------------------------
-// pagination
-// ---------------------------------------------------------------------------------------------
-
-type restPage struct {
-	perPage int
-	page    int
+func splitLines(b []byte) []string {
+	if len(b) == 0 {
+		return nil
+	}
+	var out []string
+	start := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\n' {
+			out = append(out, string(b[start:i]))
+			start = i + 1
+		}
+	}
+	if start < len(b) {
+		out = append(out, string(b[start:]))
+	}
+	return out
 }
 
-func pageOf(query url.Values) restPage {
-	perPageRaw, err1 := strconv.ParseFloat(query.Get("per_page"), 64)
-	if query.Get("per_page") == "" || err1 != nil {
-		perPageRaw = 30
+// --- the dispatcher ---------------------------------------------------------
+
+func (s *server) handleREST(req *request, res *response) {
+	if !s.requireAuth(req, res) {
+		return
 	}
-	pageRaw, err2 := strconv.ParseFloat(query.Get("page"), 64)
-	if query.Get("page") == "" || err2 != nil {
-		pageRaw = 1
+	parts := splitRest(req.path)
+	if len(parts) == 0 {
+		// GET /api/v3/
+		if req.method != "GET" {
+			s.restError(res, 404, "Not Found")
+			return
+		}
+		res.setHeader("X-OAuth-Scopes", "repo")
+		res.body = []byte(`{"current_user_url":"/api/v3/user","repository_url":"/api/v3/repos/{owner}/{repo}"}`)
+		return
 	}
-	perPage := int(perPageRaw)
-	if perPage < 1 {
-		perPage = 1
+	switch parts[0] {
+	case "meta":
+		if req.method == "GET" && len(parts) == 1 {
+			res.body = []byte(`{"installed_version":"1.0.0"}`)
+			return
+		}
+	case "user":
+		s.handleUserRepos(req, res, parts[1:])
+		return
+	case "repos":
+		s.handleRepos(req, res, parts[1:])
+		return
 	}
-	if perPage > 100 {
-		perPage = 100
-	}
-	page := int(pageRaw)
-	if page < 1 {
-		page = 1
-	}
-	return restPage{perPage: perPage, page: page}
+	s.restError(res, 404, "Not Found")
 }
 
-func paginateLen(total int, page restPage) (start, end, totalPages int) {
-	totalPages = (total + page.perPage - 1) / page.perPage
-	if totalPages < 1 {
-		totalPages = 1
+func (s *server) handleUserRepos(req *request, res *response, parts []string) {
+	if len(parts) == 1 && parts[0] == "repos" {
+		switch req.method {
+		case "GET":
+			s.listUserRepos(req, res)
+			return
+		case "POST":
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			name, _ := jsonGetString(req.body, "name")
+			if name == "" {
+				s.restError(res, 422, "name is required")
+				return
+			}
+			desc, _ := jsonGetString(req.body, "description")
+			priv, _ := jsonGetBool(req.body, "private")
+			r, ok := s.createRepoFrom(name, desc, priv)
+			if !ok {
+				s.restError(res, 422, "Repository "+name+" already exists")
+				return
+			}
+			res.status = 201
+			res.body = r.repoJSON
+			return
+		}
 	}
-	start = (page.page - 1) * page.perPage
+	s.restError(res, 404, "Not Found")
+}
+
+func (s *server) listUserRepos(req *request, res *response) {
+	q := queryParams(req.query)
+	perPage := 30
+	if v, ok := q["per_page"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			perPage = n
+		}
+	}
+	page := 1
+	if v, ok := q["page"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	s.store.mu.RLock()
+	names := make([]string, 0, len(s.store.repos))
+	for name := range s.store.repos {
+		names = append(names, name)
+	}
+	// creation order: sort by Seq
+	sortReposBySeq(s.store, names)
+	total := len(names)
+	start := (page - 1) * perPage
 	if start > total {
 		start = total
 	}
-	end = start + page.perPage
+	end := start + perPage
 	if end > total {
 		end = total
 	}
-	return start, end, totalPages
+	var bodies [][]byte
+	for _, name := range names[start:end] {
+		bodies = append(bodies, s.store.repos[name].repoJSON)
+	}
+	s.store.mu.RUnlock()
+	bp := getBuf()
+	b := *bp
+	b = append(b, '[')
+	for i, body := range bodies {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, body...)
+	}
+	b = append(b, ']')
+	out := make([]byte, len(b))
+	copy(out, b)
+	putBuf(bp)
+	res.body = out
+	// Link header when more pages exist
+	if end < total {
+		host := req.headerString("host")
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		base := "http://" + host + "/api/v3/user/repos?per_page=" + strconv.Itoa(perPage)
+		lastPage := (total + perPage - 1) / perPage
+		link := "<" + base + "&page=" + strconv.Itoa(page+1) + `>; rel="next", <` + base + "&page=" + strconv.Itoa(lastPage) + `>; rel="last"`
+		res.setHeader("Link", link)
+	}
 }
 
-// linkHeader builds a GitHub `Link` header for the next/last pages, absolute on this origin.
-func linkHeader(host string, path string, query url.Values, page restPage, totalPages int) string {
-	build := func(pageNumber int) string {
-		next := url.Values{}
-		for key, values := range query {
-			next[key] = values
-		}
-		next.Set("page", strconv.Itoa(pageNumber))
-		next.Set("per_page", strconv.Itoa(page.perPage))
-		return "http://" + host + path + "?" + next.Encode()
-	}
-	var links []string
-	if page.page < totalPages {
-		links = append(links, "<"+build(page.page+1)+">; rel=\"next\"")
-	}
-	if totalPages > 1 {
-		links = append(links, "<"+build(totalPages)+">; rel=\"last\"")
-	}
-	if page.page > 1 {
-		links = append(links, "<"+build(1)+">; rel=\"first\"")
-	}
-	if page.page > 1 {
-		links = append(links, "<"+build(page.page-1)+">; rel=\"prev\"")
-	}
-	if len(links) == 0 {
-		return ""
-	}
-	return strings.Join(links, ", ")
-}
-
-// ---------------------------------------------------------------------------------------------
-// the router
-// ---------------------------------------------------------------------------------------------
-
-// HandleRest handles one REST call. segments are the decoded path parts after /api/v3;
-// query holds the query string; body is the parsed JSON body (nil when there was no
-// body); parseErr reports a malformed JSON body. It returns the status, body and any
-// extra headers.
-func HandleRest(forge *Forge, method string, segments []string, query url.Values, body any, parseErr bool, host string) RestResult {
-	if parseErr {
-		return restErr(400, "Invalid JSON")
-	}
-	path := "/api/v3"
-	if len(segments) > 0 {
-		path += "/" + strings.Join(segments, "/")
-	}
-
-	// API root and meta.
-	if len(segments) == 0 {
-		if method == "GET" {
-			return restOK(NewOMap().
-				Set("current_user_url", "/api/v3/user").
-				Set("rate_limit_url", "/api/v3/rate_limit").
-				Set("repository_url", "/api/v3/repos/{owner}/{repo}"),
-				200, map[string]string{"x-oauth-scopes": "repo, read:org"})
-		}
-		return restNotFound("")
-	}
-	if len(segments) == 1 && segments[0] == "meta" && method == "GET" {
-		return restOK(NewOMap().Set("installed_version", "forge 1.0.0"), 200, nil)
-	}
-
-	// The token's own user.
-	if len(segments) == 1 && segments[0] == "user" && method == "GET" {
-		return restOK(NewOMap().
-			Set("login", ViewerLogin).
-			Set("id", 1000).
-			Set("name", ViewerName).
-			Set("email", ViewerEmail).
-			Set("type", "User"), 200, nil)
-	}
-
-	// /user/repos: list and create.
-	if len(segments) == 2 && segments[0] == "user" && segments[1] == "repos" {
-		if method == "GET" {
-			page := pageOf(query)
-			all := make([]*Repo, 0, len(forge.Repos))
-			for _, repo := range forge.Repos {
-				all = append(all, repo)
+func sortReposBySeq(st *Store, names []string) {
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if st.repos[names[j]].Seq < st.repos[names[i]].Seq {
+				names[i], names[j] = names[j], names[i]
 			}
-			sortReposBySeq(all)
-			start, end, totalPages := paginateLen(len(all), page)
-			headers := map[string]string{}
-			if link := linkHeader(host, path, query, page, totalPages); link != "" {
-				headers["link"] = link
-			}
-			views := make([]repoView, 0, end-start)
-			for _, repo := range all[start:end] {
-				views = append(views, RepoJSON(repo))
-			}
-			return restOK(views, 200, headers)
-		}
-		if method == "POST" {
-			input := bodyObject(body, false)
-			name, ok := bodyString(input, "name")
-			if !ok || name == "" {
-				return restErr(422, "name is required")
-			}
-			if strings.Contains(name, "/") {
-				return restErr(422, "invalid repository name")
-			}
-			if forge.GetRepo(name) != nil {
-				return restErr(422, "Repository already exists")
-			}
-			isPrivate, _ := bodyBoolean(input, "private")
-			description, _ := bodyString(input, "description")
-			repo := forge.CreateRepo(name, isPrivate, description)
-			if repo == nil {
-				return restErr(422, "Repository already exists")
-			}
-			return restOK(RepoJSON(repo), 201, nil)
-		}
-		return restNotFound("")
-	}
-
-	// /repos/{owner}/{name}[/...]: everything else lives under a repository.
-	if len(segments) >= 3 && segments[0] == "repos" {
-		owner := segments[1]
-		name := segments[2]
-		if owner != ViewerLogin {
-			return restNotFound("Not Found")
-		}
-		repo := forge.GetRepo(name)
-		if repo == nil {
-			return restNotFound("Not Found")
-		}
-		return handleRepo(forge, repo, method, segments[3:], query, body, host, path)
-	}
-
-	return restNotFound("")
-}
-
-func sortReposBySeq(repos []*Repo) {
-	for i := 1; i < len(repos); i++ {
-		for j := i; j > 0 && repos[j].Seq < repos[j-1].Seq; j-- {
-			repos[j], repos[j-1] = repos[j-1], repos[j]
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------------------------
-// repository-scoped routes
-// ---------------------------------------------------------------------------------------------
-
-func handleRepo(forge *Forge, repo *Repo, method string, tail []string, query url.Values, body any, host string, path string) RestResult {
-	// The repository itself.
-	if len(tail) == 0 {
-		if method == "GET" {
-			return restOK(RepoJSON(repo), 200, nil)
-		}
-		if method == "PATCH" {
-			input := bodyObject(body, false)
-			if description, ok := bodyString(input, "description"); ok {
-				repo.Description = description
-			}
-			if isPrivate, ok := bodyBoolean(input, "private"); ok {
-				repo.IsPrivate = isPrivate
-			}
-			return restOK(RepoJSON(repo), 200, nil)
-		}
-		if method == "DELETE" {
-			forge.DeleteRepo(repo.Name)
-			return RestResult{Status: 204}
-		}
-		return restNotFound("")
+func (s *server) handleRepos(req *request, res *response, parts []string) {
+	if len(parts) < 2 {
+		s.restError(res, 404, "Not Found")
+		return
 	}
-
-	// Branches.
-	if tail[0] == "branches" && len(tail) == 1 && method == "GET" {
-		var names []string
-		for ref := range repo.Refs {
-			if strings.HasPrefix(ref, "refs/heads/") {
-				names = append(names, ref[len("refs/heads/"):])
+	owner, name := parts[0], parts[1]
+	// repo-scoped routes
+	if len(parts) == 2 {
+		switch req.method {
+		case "GET":
+			r := s.getRepo(owner, name)
+			if r == nil {
+				s.restError(res, 404, "Not Found")
+				return
 			}
+			res.body = r.repoJSON
+			return
+		case "PATCH":
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			s.store.mu.Lock()
+			r := s.store.repos[name]
+			if owner != ownerLogin || r == nil {
+				s.store.mu.Unlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			if desc, ok := jsonGetString(req.body, "description"); ok {
+				r.Description = desc
+			}
+			s.store.cacheRepo(r)
+			body := r.repoJSON
+			s.store.mu.Unlock()
+			res.body = body
+			return
+		case "DELETE":
+			s.store.mu.Lock()
+			r := s.store.repos[name]
+			if owner != ownerLogin || r == nil {
+				s.store.mu.Unlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			delete(s.store.repos, name)
+			s.store.mu.Unlock()
+			res.status = 204
+			res.noBody = true
+			return
 		}
-		sortStrings(names)
-		branches := make([]*OMap, 0, len(names))
-		for _, name := range names {
-			tip, _ := repo.Refs["refs/heads/"+name]
-			branches = append(branches, NewOMap().
-				Set("name", name).
-				Set("commit", NewOMap().Set("sha", tip)).
-				Set("protected", false))
-		}
-		return restOK(branches, 200, nil)
+		s.restError(res, 404, "Not Found")
+		return
 	}
-	if tail[0] == "branches" && len(tail) == 2 && method == "GET" {
-		tip, ok := forge.BranchTip(repo, tail[1])
-		if !ok {
-			return restNotFound("Branch not found")
-		}
-		return restOK(NewOMap().
-			Set("name", tail[1]).
-			Set("commit", NewOMap().Set("sha", tip)).
-			Set("protected", false), 200, nil)
+	// sub-resources: need the repo
+	r := s.getRepo(owner, name)
+	if r == nil {
+		s.restError(res, 404, "Not Found")
+		return
 	}
+	rest := parts[2:]
+	switch rest[0] {
+	case "branches":
+		if req.method == "GET" && len(rest) == 1 {
+			s.store.mu.RLock()
+			names := make([]string, 0, len(r.Refs))
+			for ref := range r.Refs {
+				if strings.HasPrefix(ref, "refs/heads/") {
+					names = append(names, strings.TrimPrefix(ref, "refs/heads/"))
+				}
+			}
+			for i := 0; i < len(names); i++ {
+				for j := i + 1; j < len(names); j++ {
+					if names[j] < names[i] {
+						names[i], names[j] = names[j], names[i]
+					}
+				}
+			}
+			bp := getBuf()
+			b := *bp
+			b = append(b, '[')
+			for i, bn := range names {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = append(b, `{"name":`...)
+				b = jsonEscape(b, bn)
+				b = append(b, `,"commit":{"sha":`...)
+				b = jsonEscape(b, r.Refs["refs/heads/"+bn])
+				b = append(b, `},"protected":false}`...)
+			}
+			b = append(b, ']')
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			s.store.mu.RUnlock()
+			res.body = out
+			return
+		}
+	case "git":
+		if len(rest) == 2 && rest[1] == "refs" && req.method == "POST" {
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			ref, _ := jsonGetString(req.body, "ref")
+			sha, _ := jsonGetString(req.body, "sha")
+			if ref == "" || sha == "" {
+				s.restError(res, 422, "ref and sha are required")
+				return
+			}
+			s.store.mu.Lock()
+			if _, ok := r.Objects[sha]; !ok {
+				s.store.mu.Unlock()
+				s.restError(res, 422, "object not found")
+				return
+			}
+			r.Refs[ref] = sha
+			r.packVer++
+			s.store.mu.Unlock()
+			bp := getBuf()
+			b := *bp
+			b = append(b, `{"ref":`...)
+			b = jsonEscape(b, ref)
+			b = append(b, `,"object":{"sha":`...)
+			b = jsonEscape(b, sha)
+			b = append(b, `,"type":"commit"}}`...)
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			res.status = 201
+			res.body = out
+			return
+		}
+	case "commits":
+		if req.method == "GET" && len(rest) == 1 {
+			q := queryParams(req.query)
+			s.store.mu.RLock()
+			tip := r.treeAt(q["sha"])
+			_ = tip
+			var refTip string
+			if q["sha"] != "" {
+				if oid, ok := r.Refs["refs/heads/"+q["sha"]]; ok {
+					refTip = oid
+				} else if oid, ok := r.Refs[q["sha"]]; ok {
+					refTip = oid
+				} else if isOID(q["sha"]) {
+					refTip = q["sha"]
+				}
+			} else {
+				refTip, _ = r.Refs["refs/heads/"+r.DefaultBranch]
+			}
+			commits := commitList(r, refTip)
+			bp := getBuf()
+			b := *bp
+			b = append(b, '[')
+			for i, oid := range commits {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				obj := r.Objects[oid]
+				msg := ""
+				author := ""
+				if obj != nil {
+					cv := parseCommit(obj.Data)
+					msg = strings.TrimRight(cv.Message, "\n")
+					author = cv.Author
+				}
+				name, email := parseAuthor(author)
+				b = append(b, `{"sha":`...)
+				b = jsonEscape(b, oid)
+				b = append(b, `,"commit":{"message":`...)
+				b = jsonEscape(b, msg)
+				b = append(b, `,"author":{"name":`...)
+				b = jsonEscape(b, name)
+				b = append(b, `,"email":`...)
+				b = jsonEscape(b, email)
+				b = append(b, `,"date":"2026-11-14T06:30:00Z"},"committer":{"name":`...)
+				b = jsonEscape(b, name)
+				b = append(b, `,"email":`...)
+				b = jsonEscape(b, email)
+				b = append(b, `,"date":"2026-11-14T06:30:00Z"}}}`...)
+			}
+			b = append(b, ']')
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			s.store.mu.RUnlock()
+			res.body = out
+			return
+		}
+	case "contents":
+		s.handleContents(req, res, r, rest[1:])
+		return
+	case "labels":
+		if req.method == "POST" && len(rest) == 1 {
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			name, _ := jsonGetString(req.body, "name")
+			color, _ := jsonGetString(req.body, "color")
+			if name == "" {
+				s.restError(res, 422, "name is required")
+				return
+			}
+			s.store.mu.Lock()
+			r.Labels[name] = &Label{Name: name, Color: color}
+			s.store.mu.Unlock()
+			bp := getBuf()
+			b := *bp
+			b = append(b, `{"name":`...)
+			b = jsonEscape(b, name)
+			b = append(b, `,"color":`...)
+			b = jsonEscape(b, color)
+			b = append(b, `,"description":""}`...)
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			res.status = 201
+			res.body = out
+			return
+		}
+	case "issues":
+		s.handleIssues(req, res, r, rest[1:])
+		return
+	case "pulls":
+		s.handlePulls(req, res, r, rest[1:])
+		return
+	}
+	s.restError(res, 404, "Not Found")
+}
 
-	// Commits: ?sha=<branch or commit>; newest first.
-	if tail[0] == "commits" && len(tail) == 1 && method == "GET" {
-		shaParam := query.Get("sha")
-		var tip string
-		var ok bool
-		if shaParam == "" {
-			tip, ok = forge.BranchTip(repo, DefaultBranch)
-		} else if IsOid(shaParam) {
-			_, ok = repo.Objects[shaParam]
-			tip = shaParam
+func parseAuthor(a string) (name, email string) {
+	// "Name <email> ts tz"
+	lt := strings.IndexByte(a, '<')
+	gt := strings.IndexByte(a, '>')
+	if lt < 0 || gt < 0 {
+		return a, ""
+	}
+	return strings.TrimSpace(a[:lt]), a[lt+1 : gt]
+}
+
+// --- contents ---------------------------------------------------------------
+
+func (s *server) handleContents(req *request, res *response, r *Repo, parts []string) {
+	path := strings.Join(parts, "/")
+	q := queryParams(req.query)
+	switch req.method {
+	case "GET":
+		if len(parts) == 0 {
+			s.restError(res, 404, "Not Found")
+			return
+		}
+		s.store.mu.RLock()
+		tree := r.treeAt(q["ref"])
+		// directory?
+		if s.contentsIsDir(r, tree, path) {
+			entries := s.contentsDirEntries(r, tree, path)
+			s.store.mu.RUnlock()
+			res.body = entries
+			return
+		}
+		oid, data := lookupBlob(r, tree, path)
+		if data == nil {
+			s.store.mu.RUnlock()
+			s.restError(res, 404, "Not Found")
+			return
+		}
+		bp := getBuf()
+		b := *bp
+		b = append(b, `{"type":"file","encoding":"base64","content":`...)
+		b = jsonEscape(b, base64.StdEncoding.EncodeToString(data))
+		b = append(b, `,"sha":`...)
+		b = jsonEscape(b, oid)
+		b = append(b, `,"size":`...)
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, `,"name":`...)
+		b = jsonEscape(b, baseName(path))
+		b = append(b, `,"path":`...)
+		b = jsonEscape(b, path)
+		b = append(b, `}`...)
+		out := make([]byte, len(b))
+		copy(out, b)
+		putBuf(bp)
+		s.store.mu.RUnlock()
+		res.body = out
+		return
+	case "PUT":
+		if !validJSON(req.body) {
+			s.restError(res, 400, "Invalid JSON")
+			return
+		}
+		msg, _ := jsonGetString(req.body, "message")
+		contentB64, _ := jsonGetString(req.body, "content")
+		branch, _ := jsonGetString(req.body, "branch")
+		if branch == "" {
+			branch = r.DefaultBranch
+		}
+		sha, hasSHA := jsonGetString(req.body, "sha")
+		data, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(contentB64, "\n", ""))
+		if err != nil {
+			s.restError(res, 400, "Invalid base64 content")
+			return
+		}
+		s.store.mu.Lock()
+		// stale sha check
+		tree := r.treeAt(branch)
+		curOID, _ := lookupBlob(r, tree, path)
+		isUpdate := curOID != ""
+		if hasSHA && isUpdate && sha != curOID {
+			s.store.mu.Unlock()
+			s.restError(res, 409, "sha does not match")
+			return
+		}
+		if hasSHA && !isUpdate {
+			// updating a file that does not exist: treat as create
+			isUpdate = false
+		}
+		commitOID, blobOID := s.commitFile(r, branch, path, data, msg)
+		s.store.mu.Unlock()
+		bp := getBuf()
+		b := *bp
+		b = append(b, `{"content":{"name":`...)
+		b = jsonEscape(b, baseName(path))
+		b = append(b, `,"path":`...)
+		b = jsonEscape(b, path)
+		b = append(b, `,"sha":`...)
+		b = jsonEscape(b, blobOID)
+		b = append(b, `,"size":`...)
+		b = strconv.AppendInt(b, int64(len(data)), 10)
+		b = append(b, `,"type":"file","encoding":"base64"},"commit":{"sha":`...)
+		b = jsonEscape(b, commitOID)
+		b = append(b, `,"message":`...)
+		b = jsonEscape(b, msg)
+		b = append(b, `}}`...)
+		out := make([]byte, len(b))
+		copy(out, b)
+		putBuf(bp)
+		if isUpdate {
+			res.status = 200
 		} else {
-			tip, ok = forge.BranchTip(repo, shaParam)
+			res.status = 201
 		}
+		res.body = out
+		return
+	case "DELETE":
+		if len(req.body) > 0 && !validJSON(req.body) {
+			s.restError(res, 400, "Invalid JSON")
+			return
+		}
+		msg, _ := jsonGetString(req.body, "message")
+		branch, _ := jsonGetString(req.body, "branch")
+		if branch == "" {
+			branch = r.DefaultBranch
+		}
+		s.store.mu.Lock()
+		commitOID, ok := s.deleteFile(r, branch, path, msg)
+		s.store.mu.Unlock()
 		if !ok {
-			return restNotFound("No commit found for SHA")
+			s.restError(res, 404, "Not Found")
+			return
 		}
-		_ = tip
-		page := pageOf(query)
-		walk := forge.ListCommits(repo, shaParam)
-		start, end, totalPages := paginateLen(len(walk), page)
-		headers := map[string]string{}
-		if link := linkHeader(host, path, query, page, totalPages); link != "" {
-			headers["link"] = link
-		}
-		entries := make([]*OMap, 0, end-start)
-		for _, oid := range walk[start:end] {
-			object := repo.Objects[oid]
-			parsed, err := ParseCommit(object.Bytes)
-			if err != nil {
-				continue
-			}
-			authorName, authorEmail, authorDate := ParseIdentity(parsed.Author)
-			committerName, committerEmail, committerDate := ParseIdentity(parsed.Committer)
-			parents := make([]*OMap, 0, len(parsed.Parents))
-			for _, parent := range parsed.Parents {
-				parents = append(parents, NewOMap().Set("sha", parent))
-			}
-			entries = append(entries, NewOMap().
-				Set("sha", oid).
-				Set("commit", NewOMap().
-					Set("message", parsed.Message).
-					Set("author", NewOMap().Set("name", authorName).Set("email", authorEmail).Set("date", authorDate)).
-					Set("committer", NewOMap().Set("name", committerName).Set("email", committerEmail).Set("date", committerDate))).
-				Set("author", NewOMap().Set("login", ViewerLogin).Set("id", 1000).Set("type", "User")).
-				Set("parents", parents))
-		}
-		return restOK(entries, 200, headers)
+		bp := getBuf()
+		b := *bp
+		b = append(b, `{"commit":{"sha":`...)
+		b = jsonEscape(b, commitOID)
+		b = append(b, `}}`...)
+		out := make([]byte, len(b))
+		copy(out, b)
+		putBuf(bp)
+		res.body = out
+		return
 	}
-
-	// git refs: create a ref, or read one branch ref.
-	if tail[0] == "git" && len(tail) >= 2 && tail[1] == "refs" && len(tail) == 2 && method == "POST" {
-		input := bodyObject(body, false)
-		ref, refOK := bodyString(input, "ref")
-		sha, shaOK := bodyString(input, "sha")
-		if !refOK || !shaOK {
-			return restErr(422, "ref and sha are required")
-		}
-		if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/tags/") {
-			return restErr(422, "invalid ref")
-		}
-		if _, exists := repo.Refs[ref]; exists {
-			return restErr(422, "Reference already exists")
-		}
-		target, exists := repo.Objects[sha]
-		if !exists || !IsOid(sha) {
-			return restErr(422, "Invalid SHA")
-		}
-		repo.Refs[ref] = sha
-		forge.TouchGit(repo)
-		return restOK(NewOMap().
-			Set("ref", ref).
-			Set("object", NewOMap().Set("sha", sha).Set("type", string(target.Kind))), 201, nil)
-	}
-	if tail[0] == "git" && len(tail) >= 2 && tail[1] == "refs" && len(tail) >= 3 && tail[2] == "heads" && len(tail) == 4 && method == "GET" {
-		tip, ok := forge.BranchTip(repo, tail[3])
-		if !ok {
-			return restNotFound("Branch not found")
-		}
-		return restOK(NewOMap().
-			Set("ref", "refs/heads/"+tail[3]).
-			Set("object", NewOMap().Set("sha", tip).Set("type", "commit")), 200, nil)
-	}
-
-	// contents: files and directories, base64 through PUT.
-	if tail[0] == "contents" {
-		contentPath := strings.Join(tail[1:], "/")
-		ref := query.Get("ref")
-		if method == "GET" {
-			read := forge.ReadPath(repo, contentPath, ref)
-			if read == nil {
-				return restNotFound("Not Found")
-			}
-			if read.Kind == "blob" {
-				bytes := read.Bytes
-				if bytes == nil {
-					bytes = []byte{}
-				}
-				name := contentPath
-				if idx := strings.LastIndex(contentPath, "/"); idx >= 0 {
-					name = contentPath[idx+1:]
-				}
-				return restOK(NewOMap().
-					Set("type", "file").
-					Set("encoding", "base64").
-					Set("content", base64.StdEncoding.EncodeToString(bytes)).
-					Set("sha", read.Oid).
-					Set("size", len(bytes)).
-					Set("name", name).
-					Set("path", contentPath), 200, nil)
-			}
-			dirEntries := forge.ListDir(repo, contentPath, ref)
-			if dirEntries == nil {
-				return restNotFound("Not Found")
-			}
-			entries := make([]*OMap, 0, len(dirEntries))
-			for _, entry := range dirEntries {
-				size := 0
-				if entry.Kind == "file" {
-					if obj, ok := repo.Objects[entry.Oid]; ok {
-						size = len(obj.Bytes)
-					}
-				}
-				entries = append(entries, NewOMap().
-					Set("type", entry.Kind).
-					Set("name", entry.Name).
-					Set("path", entry.Path).
-					Set("sha", entry.Oid).
-					Set("size", size))
-			}
-			return restOK(entries, 200, nil)
-		}
-		if method == "PUT" {
-			input := bodyObject(body, false)
-			content, ok := bodyString(input, "content")
-			message, hasMessage := bodyString(input, "message")
-			if !hasMessage {
-				message = "Update file"
-			}
-			branch, _ := bodyString(input, "branch")
-			sha, hasSha := bodyString(input, "sha")
-			if !ok {
-				return restErr(422, "content is required")
-			}
-			cleaned := strings.Map(func(r rune) rune {
-				if r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\v' || r == '\f' {
-					return -1
-				}
-				return r
-			}, content)
-			decoded, err := base64.StdEncoding.DecodeString(cleaned)
-			if err != nil {
-				return restErr(422, "content is not valid base64")
-			}
-			var expectedSha *string
-			if hasSha {
-				expectedSha = &sha
-			}
-			result := forge.WriteFile(repo, contentPath, decoded, true, message, branch, expectedSha)
-			if result.Error != "" {
-				switch result.Error {
-				case "stale sha":
-					return restErr(409, "sha does not match")
-				case "file does not exist":
-					return restErr(404, "Not Found")
-				default:
-					return restErr(422, result.Error)
-				}
-			}
-			fileName := contentPath
-			if idx := strings.LastIndex(contentPath, "/"); idx >= 0 {
-				fileName = contentPath[idx+1:]
-			}
-			status := 200
-			if result.Created {
-				status = 201
-			}
-			return restOK(NewOMap().
-				Set("content", NewOMap().
-					Set("name", fileName).
-					Set("path", contentPath).
-					Set("sha", strOrNil(result.BlobSha)).
-					Set("size", len(decoded)).
-					Set("type", "file").
-					Set("encoding", "base64")).
-				Set("commit", NewOMap().Set("sha", result.CommitSha).Set("message", message)),
-				status, nil)
-		}
-		if method == "DELETE" {
-			input := bodyObject(body, false)
-			message, hasMessage := bodyString(input, "message")
-			if !hasMessage {
-				message = "Delete file"
-			}
-			branch, _ := bodyString(input, "branch")
-			sha, hasSha := bodyString(input, "sha")
-			var expectedSha *string
-			if hasSha {
-				expectedSha = &sha
-			}
-			result := forge.WriteFile(repo, contentPath, nil, false, message, branch, expectedSha)
-			if result.Error != "" {
-				switch result.Error {
-				case "stale sha":
-					return restErr(409, "sha does not match")
-				case "file does not exist":
-					return restErr(404, "Not Found")
-				default:
-					return restErr(422, result.Error)
-				}
-			}
-			return restOK(NewOMap().Set("commit", NewOMap().Set("sha", result.CommitSha).Set("message", message)), 200, nil)
-		}
-		return restNotFound("")
-	}
-
-	// labels.
-	if tail[0] == "labels" && len(tail) == 1 {
-		if method == "GET" {
-			labels := make([]*OMap, 0, len(repo.Labels))
-			for _, label := range repo.Labels {
-				labels = append(labels, NewOMap().
-					Set("id", label.ID).
-					Set("name", label.Name).
-					Set("color", label.Color).
-					Set("description", ""))
-			}
-			return restOK(labels, 200, nil)
-		}
-		if method == "POST" {
-			input := bodyObject(body, false)
-			name, ok := bodyString(input, "name")
-			if !ok || name == "" {
-				return restErr(422, "name is required")
-			}
-			color, hasColor := bodyString(input, "color")
-			if !hasColor {
-				color = "ededed"
-			}
-			if existing, ok := repo.Labels[name]; ok {
-				return restOK(NewOMap().
-					Set("id", existing.ID).
-					Set("name", existing.Name).
-					Set("color", existing.Color).
-					Set("description", ""), 201, nil)
-			}
-			label := &Label{ID: nil, Name: name, Color: color}
-			repo.Labels[name] = label
-			return restOK(NewOMap().
-				Set("id", label.ID).
-				Set("name", name).
-				Set("color", color).
-				Set("description", ""), 201, nil)
-		}
-		return restNotFound("")
-	}
-
-	// issues and comments.
-	if tail[0] == "issues" && len(tail) == 1 {
-		if method == "GET" {
-			state := query.Get("state")
-			if state == "" {
-				state = "open"
-			}
-			direction := query.Get("direction")
-			if direction == "" {
-				direction = "desc"
-			}
-			list := make([]*Issue, 0, len(repo.Issues))
-			for _, issue := range repo.Issues {
-				if state != "all" && issue.State != state {
-					continue
-				}
-				list = append(list, issue)
-			}
-			sortIssuesBySeq(list, direction == "asc")
-			page := pageOf(query)
-			start, end, totalPages := paginateLen(len(list), page)
-			headers := map[string]string{}
-			if link := linkHeader(host, path, query, page, totalPages); link != "" {
-				headers["link"] = link
-			}
-			views := make([]issueView, 0, end-start)
-			for _, issue := range list[start:end] {
-				views = append(views, IssueJSON(repo, issue))
-			}
-			return restOK(views, 200, headers)
-		}
-		if method == "POST" {
-			input := bodyObject(body, false)
-			title, ok := bodyString(input, "title")
-			if !ok || title == "" {
-				return restErr(422, "title is required")
-			}
-			bodyText, _ := bodyString(input, "body")
-			var labels []string
-			if raw, ok := input["labels"].([]any); ok {
-				for _, entry := range raw {
-					if str, ok := entry.(string); ok {
-						labels = append(labels, str)
-					}
-				}
-			}
-			created := forge.CreateIssue(repo, title, bodyText, labels)
-			if created.Error != "" {
-				return restErr(422, created.Error)
-			}
-			return restOK(IssueJSON(repo, created.Issue), 201, nil)
-		}
-		return restNotFound("")
-	}
-	if tail[0] == "issues" && len(tail) == 2 {
-		number, _ := strconv.Atoi(tail[1])
-		issue := repo.IssueByNumber[number]
-		if issue == nil {
-			for _, entry := range repo.Issues {
-				if entry.Number == number {
-					issue = entry
-					break
-				}
-			}
-		}
-		if issue == nil {
-			return restNotFound("Not Found")
-		}
-		if method == "GET" {
-			return restOKRaw(IssueJSONText(repo, issue), 200, nil)
-		}
-		if method == "PATCH" {
-			input := bodyObject(body, false)
-			if state, ok := bodyString(input, "state"); ok && (state == "open" || state == "closed") {
-				issue.State = state
-			}
-			if title, ok := bodyString(input, "title"); ok {
-				issue.Title = title
-			}
-			if bodyText, ok := bodyString(input, "body"); ok {
-				issue.Body = bodyText
-			}
-			DropIssueJSONCache(repo, issue.Number)
-			return restOKRaw(IssueJSONText(repo, issue), 200, nil)
-		}
-		return restNotFound("")
-	}
-	if tail[0] == "issues" && len(tail) == 3 && tail[2] == "comments" {
-		number, _ := strconv.Atoi(tail[1])
-		var issue *Issue
-		for _, entry := range repo.Issues {
-			if entry.Number == number {
-				issue = entry
-				break
-			}
-		}
-		if issue == nil {
-			return restNotFound("Not Found")
-		}
-		if method == "GET" {
-			comments := repo.Comments[number]
-			views := make([]*OMap, 0, len(comments))
-			for _, comment := range comments {
-				views = append(views, NewOMap().
-					Set("id", comment.ID).
-					Set("body", comment.Body).
-					Set("user", NewOMap().Set("login", ViewerLogin).Set("id", 1000).Set("type", "User")).
-					Set("created_at", issue.CreatedAt))
-			}
-			return restOK(views, 200, nil)
-		}
-		if method == "POST" {
-			input := bodyObject(body, false)
-			text, ok := bodyString(input, "body")
-			if !ok || text == "" {
-				return restErr(422, "body is required")
-			}
-			comment := forge.AddComment(repo, number, text)
-			if comment == nil {
-				return restNotFound("Not Found")
-			}
-			return restOK(NewOMap().
-				Set("id", comment.ID).
-				Set("body", comment.Body).
-				Set("user", NewOMap().Set("login", ViewerLogin).Set("id", 1000).Set("type", "User")).
-				Set("created_at", issue.CreatedAt), 201, nil)
-		}
-		return restNotFound("")
-	}
-
-	// pull requests.
-	if tail[0] == "pulls" && len(tail) == 1 {
-		if method == "GET" {
-			state := query.Get("state")
-			if state == "" {
-				state = "open"
-			}
-			list := make([]*Pull, 0, len(repo.Pulls))
-			for _, pull := range repo.Pulls {
-				if state != "all" && pull.State != state {
-					continue
-				}
-				list = append(list, pull)
-			}
-			sortPullsBySeqDesc(list)
-			page := pageOf(query)
-			start, end, totalPages := paginateLen(len(list), page)
-			headers := map[string]string{}
-			if link := linkHeader(host, path, query, page, totalPages); link != "" {
-				headers["link"] = link
-			}
-			views := make([]pullView, 0, end-start)
-			for _, pull := range list[start:end] {
-				views = append(views, PullJSON(repo, pull, forge))
-			}
-			return restOK(views, 200, headers)
-		}
-		if method == "POST" {
-			input := bodyObject(body, false)
-			head, headOK := bodyString(input, "head")
-			base, hasBase := bodyString(input, "base")
-			if !hasBase {
-				base = DefaultBranch
-			}
-			title, titleOK := bodyString(input, "title")
-			if !headOK || !titleOK || title == "" {
-				return restErr(422, "head and title are required")
-			}
-			bodyText, _ := bodyString(input, "body")
-			created := forge.CreatePull(repo, head, base, title, bodyText)
-			if created.Error != "" {
-				return restErr(422, created.Error)
-			}
-			return restOK(PullJSON(repo, created.Pull, forge), 201, nil)
-		}
-		return restNotFound("")
-	}
-	if tail[0] == "pulls" && len(tail) == 2 {
-		number, _ := strconv.Atoi(tail[1])
-		var pull *Pull
-		for _, entry := range repo.Pulls {
-			if entry.Number == number {
-				pull = entry
-				break
-			}
-		}
-		if pull == nil {
-			return restNotFound("Not Found")
-		}
-		if method == "GET" {
-			return restOK(PullJSON(repo, pull, forge), 200, nil)
-		}
-		return restNotFound("")
-	}
-	if tail[0] == "pulls" && len(tail) == 3 && tail[2] == "files" && method == "GET" {
-		number, _ := strconv.Atoi(tail[1])
-		var pull *Pull
-		for _, entry := range repo.Pulls {
-			if entry.Number == number {
-				pull = entry
-				break
-			}
-		}
-		if pull == nil {
-			return restNotFound("Not Found")
-		}
-		files := forge.PullFiles(repo, pull)
-		views := make([]*OMap, 0, len(files))
-		for _, file := range files {
-			views = append(views, NewOMap().
-				Set("filename", file.Path).
-				Set("status", file.Status).
-				Set("additions", file.Additions).
-				Set("deletions", file.Deletions).
-				Set("changes", file.Changes))
-		}
-		return restOK(views, 200, nil)
-	}
-	if tail[0] == "pulls" && len(tail) == 3 && tail[2] == "merge" && method == "PUT" {
-		number, _ := strconv.Atoi(tail[1])
-		var pull *Pull
-		for _, entry := range repo.Pulls {
-			if entry.Number == number {
-				pull = entry
-				break
-			}
-		}
-		if pull == nil {
-			return restNotFound("Not Found")
-		}
-		merged := forge.MergeSquash(repo, pull)
-		if merged.Error != "" {
-			switch merged.Error {
-			case "conflict":
-				return restErr(405, "Pull request is not mergeable")
-			case "already-merged":
-				return restErr(405, "Pull request is already merged")
-			default:
-				return restErr(422, merged.Error)
-			}
-		}
-		return restOK(NewOMap().
-			Set("merged", true).
-			Set("sha", merged.Sha).
-			Set("message", "Merged pull request #"+strconv.Itoa(number)), 200, nil)
-	}
-
-	return restNotFound("")
+	s.restError(res, 404, "Not Found")
 }
 
-func strOrNil(s *string) any {
-	if s == nil {
+func baseName(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+func (s *server) contentsIsDir(r *Repo, treeOID, path string) bool {
+	parts := splitPath(path)
+	cur := treeOID
+	for i, p := range parts {
+		obj := r.Objects[cur]
+		if obj == nil || obj.Type != "tree" {
+			return false
+		}
+		var next string
+		var mode string
+		for _, e := range parseTree(obj.Data) {
+			if e.Name == p {
+				next, mode = e.OID, e.Mode
+				break
+			}
+		}
+		if next == "" {
+			return false
+		}
+		// only the final segment being a tree makes the path a directory;
+		// an intermediate tree just lets the walk continue
+		if i == len(parts)-1 {
+			return mode == "40000"
+		}
+		if mode != "40000" {
+			return false
+		}
+		cur = next
+	}
+	return false
+}
+
+func (s *server) contentsDirEntries(r *Repo, treeOID, path string) []byte {
+	parts := splitPath(path)
+	cur := treeOID
+	for _, p := range parts {
+		obj := r.Objects[cur]
+		if obj == nil || obj.Type != "tree" {
+			return []byte("[]")
+		}
+		for _, e := range parseTree(obj.Data) {
+			if e.Name == p {
+				cur = e.OID
+				break
+			}
+		}
+	}
+	obj := r.Objects[cur]
+	if obj == nil || obj.Type != "tree" {
+		return []byte("[]")
+	}
+	bp := getBuf()
+	b := *bp
+	b = append(b, '[')
+	entries := parseTree(obj.Data)
+	for i, e := range entries {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		typ := "file"
+		size := 0
+		if e.Mode == "40000" {
+			typ = "dir"
+		} else if bo := r.Objects[e.OID]; bo != nil {
+			size = len(bo.Data)
+		}
+		fullPath := path + "/" + e.Name
+		b = append(b, `{"type":`...)
+		b = jsonEscape(b, typ)
+		b = append(b, `,"name":`...)
+		b = jsonEscape(b, e.Name)
+		b = append(b, `,"path":`...)
+		b = jsonEscape(b, fullPath)
+		b = append(b, `,"sha":`...)
+		b = jsonEscape(b, e.OID)
+		b = append(b, `,"size":`...)
+		b = strconv.AppendInt(b, int64(size), 10)
+		b = append(b, `}`...)
+	}
+	b = append(b, ']')
+	out := make([]byte, len(b))
+	copy(out, b)
+	putBuf(bp)
+	return out
+}
+
+// --- issues ------------------------------------------------------------------
+
+func (s *server) handleIssues(req *request, res *response, r *Repo, parts []string) {
+	if len(parts) == 0 {
+		switch req.method {
+		case "POST":
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			title, _ := jsonGetString(req.body, "title")
+			body, _ := jsonGetString(req.body, "body")
+			labels := jsonGetStringArray(req.body, "labels")
+			s.store.mu.Lock()
+			is, bad := s.createIssueIn(r, title, body, labels)
+			if is == nil {
+				s.store.mu.Unlock()
+				s.restError(res, 422, "Label "+bad+" does not exist")
+				return
+			}
+			rendered := *is.rendered.Load()
+			s.store.mu.Unlock()
+			res.status = 201
+			res.body = rendered
+			return
+		case "GET":
+			q := queryParams(req.query)
+			state := q["state"]
+			if state == "" {
+				state = "open"
+			}
+			direction := q["direction"]
+			asc := direction == "asc"
+			s.store.mu.RLock()
+			var list []*Issue
+			for _, is := range r.Issues {
+				if state == "all" || is.State == state {
+					list = append(list, is)
+				}
+			}
+			list = sortedIssues(list, asc)
+			bp := getBuf()
+			b := *bp
+			b = append(b, '[')
+			for i, is := range list {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = append(b, *is.rendered.Load()...)
+			}
+			b = append(b, ']')
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			s.store.mu.RUnlock()
+			res.body = out
+			return
+		}
+		s.restError(res, 404, "Not Found")
+		return
+	}
+	// /issues/{n} or /issues/{n}/comments
+	num, err := strconv.Atoi(parts[0])
+	if err != nil || num <= 0 {
+		s.restError(res, 404, "Not Found")
+		return
+	}
+	if len(parts) == 1 {
+		switch req.method {
+		case "GET":
+			// HOT PATH: the read workload GETs one issue 2,000 times.
+			// Serve the pre-rendered bytes; one map lookup, no marshal.
+			s.store.mu.RLock()
+			is := r.IssueByNum[num]
+			if is == nil {
+				s.store.mu.RUnlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			body := *is.rendered.Load()
+			s.store.mu.RUnlock()
+			res.body = body
+			return
+		case "PATCH":
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			s.store.mu.Lock()
+			is := r.IssueByNum[num]
+			if is == nil {
+				s.store.mu.Unlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			if st, ok := jsonGetString(req.body, "state"); ok {
+				is.State = st
+			}
+			if t, ok := jsonGetString(req.body, "title"); ok {
+				is.Title = t
+			}
+			if bd, ok := jsonGetString(req.body, "body"); ok {
+				is.Body = bd
+			}
+			s.store.cacheIssue(r, is)
+			rendered := *is.rendered.Load()
+			s.store.mu.Unlock()
+			res.body = rendered
+			return
+		}
+		s.restError(res, 404, "Not Found")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "comments" {
+		switch req.method {
+		case "GET":
+			s.store.mu.RLock()
+			is := r.IssueByNum[num]
+			if is == nil {
+				s.store.mu.RUnlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			bp := getBuf()
+			b := *bp
+			b = append(b, '[')
+			for i, c := range is.Comments {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = append(b, `{"id":`...)
+				b = strconv.AppendInt(b, int64(c.ID), 10)
+				b = append(b, `,"body":`...)
+				b = jsonEscape(b, c.Body)
+				b = append(b, `,"user":{"login":"`...)
+				b = append(b, ownerLogin...)
+				b = append(b, `"},"created_at":"2026-11-14T06:30:00Z"}`...)
+			}
+			b = append(b, ']')
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			s.store.mu.RUnlock()
+			res.body = out
+			return
+		case "POST":
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			body, _ := jsonGetString(req.body, "body")
+			s.store.mu.Lock()
+			is := r.IssueByNum[num]
+			if is == nil {
+				s.store.mu.Unlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			c := &Comment{ID: r.NextComment, Body: body, Seq: s.store.nextSeq()}
+			r.NextComment++
+			is.Comments = append(is.Comments, c)
+			s.store.cacheIssue(r, is)
+			s.store.mu.Unlock()
+			bp := getBuf()
+			b := *bp
+			b = append(b, `{"id":`...)
+			b = strconv.AppendInt(b, int64(c.ID), 10)
+			b = append(b, `,"body":`...)
+			b = jsonEscape(b, body)
+			b = append(b, `,"user":{"login":"`...)
+			b = append(b, ownerLogin...)
+			b = append(b, `"},"created_at":"2026-11-14T06:30:00Z"}`...)
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			res.status = 201
+			res.body = out
+			return
+		}
+	}
+	s.restError(res, 404, "Not Found")
+}
+
+// jsonGetStringArray extracts a top-level array of strings.
+func jsonGetStringArray(body []byte, key string) []string {
+	needle := []byte(`"` + key + `"`)
+	i := indexBytes(body, needle)
+	if i < 0 {
 		return nil
 	}
-	return *s
-}
-
-func sortStrings(values []string) {
-	for i := 1; i < len(values); i++ {
-		for j := i; j > 0 && values[j] < values[j-1]; j-- {
-			values[j], values[j-1] = values[j-1], values[j]
-		}
+	j := i + len(needle)
+	for j < len(body) && (body[j] == ' ' || body[j] == '\t' || body[j] == '\n' || body[j] == '\r' || body[j] == ':') {
+		j++
 	}
-}
-
-func sortIssuesBySeq(list []*Issue, asc bool) {
-	for i := 1; i < len(list); i++ {
-		for j := i; j > 0; j-- {
-			less := list[j].Seq < list[j-1].Seq
-			if !asc {
-				less = list[j].Seq > list[j-1].Seq
+	if j >= len(body) || body[j] != '[' {
+		return nil
+	}
+	j++
+	var out []string
+	for j < len(body) {
+		// skip whitespace/commas
+		for j < len(body) && (body[j] == ' ' || body[j] == '\t' || body[j] == '\n' || body[j] == '\r' || body[j] == ',') {
+			j++
+		}
+		if j >= len(body) || body[j] == ']' {
+			break
+		}
+		if body[j] != '"' {
+			break
+		}
+		j++
+		var sb strings.Builder
+		for j < len(body) && body[j] != '"' {
+			if body[j] == '\\' && j+1 < len(body) {
+				j++
+				sb.WriteByte(body[j])
+				j++
+				continue
 			}
-			if !less {
-				break
-			}
-			list[j], list[j-1] = list[j-1], list[j]
+			sb.WriteByte(body[j])
+			j++
 		}
+		if j < len(body) {
+			j++ // closing quote
+		}
+		out = append(out, sb.String())
 	}
+	return out
 }
 
-func sortPullsBySeqDesc(list []*Pull) {
-	for i := 1; i < len(list); i++ {
-		for j := i; j > 0 && list[j].Seq > list[j-1].Seq; j-- {
-			list[j], list[j-1] = list[j-1], list[j]
+// --- pulls --------------------------------------------------------------------
+
+func (s *server) handlePulls(req *request, res *response, r *Repo, parts []string) {
+	if len(parts) == 0 {
+		switch req.method {
+		case "POST":
+			if !validJSON(req.body) {
+				s.restError(res, 400, "Invalid JSON")
+				return
+			}
+			title, _ := jsonGetString(req.body, "title")
+			body, _ := jsonGetString(req.body, "body")
+			head, _ := jsonGetString(req.body, "head")
+			base, _ := jsonGetString(req.body, "base")
+			if base == "" {
+				base = r.DefaultBranch
+			}
+			s.store.mu.Lock()
+			pr, msg := s.createPullIn(r, title, body, head, base)
+			if pr == nil {
+				s.store.mu.Unlock()
+				s.restError(res, 422, msg)
+				return
+			}
+			rendered := s.renderPull(r, pr)
+			s.store.mu.Unlock()
+			res.status = 201
+			res.body = rendered
+			return
+		case "GET":
+			q := queryParams(req.query)
+			state := q["state"]
+			if state == "" {
+				state = "open"
+			}
+			s.store.mu.RLock()
+			var list []*Pull
+			for _, pr := range r.Pulls {
+				if state == "all" || pr.State == state {
+					list = append(list, pr)
+				}
+			}
+			bp := getBuf()
+			b := *bp
+			b = append(b, '[')
+			for i, pr := range list {
+				if i > 0 {
+					b = append(b, ',')
+				}
+				b = append(b, s.renderPull(r, pr)...)
+			}
+			b = append(b, ']')
+			out := make([]byte, len(b))
+			copy(out, b)
+			putBuf(bp)
+			s.store.mu.RUnlock()
+			res.body = out
+			return
 		}
+		s.restError(res, 404, "Not Found")
+		return
 	}
+	num, err := strconv.Atoi(parts[0])
+	if err != nil || num <= 0 {
+		s.restError(res, 404, "Not Found")
+		return
+	}
+	if len(parts) == 1 {
+		if req.method == "GET" {
+			s.store.mu.RLock()
+			pr := r.PullByNum[num]
+			if pr == nil {
+				s.store.mu.RUnlock()
+				s.restError(res, 404, "Not Found")
+				return
+			}
+			rendered := s.renderPull(r, pr)
+			s.store.mu.RUnlock()
+			res.body = rendered
+			return
+		}
+		s.restError(res, 404, "Not Found")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "files" && req.method == "GET" {
+		s.store.mu.RLock()
+		pr := r.PullByNum[num]
+		if pr == nil {
+			s.store.mu.RUnlock()
+			s.restError(res, 404, "Not Found")
+			return
+		}
+		diff := diffTrees(r, pr.BaseTree, pr.HeadTree)
+		baseFlat := treeFlat(r, pr.BaseTree)
+		headFlat := treeFlat(r, pr.HeadTree)
+		paths := make([]string, 0, len(diff))
+		for p := range diff {
+			paths = append(paths, p)
+		}
+		for i := 0; i < len(paths); i++ {
+			for j := i + 1; j < len(paths); j++ {
+				if paths[j] < paths[i] {
+					paths[i], paths[j] = paths[j], paths[i]
+				}
+			}
+		}
+		bp := getBuf()
+		b := *bp
+		b = append(b, '[')
+		for i, p := range paths {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			status := diff[p]
+			add, del := 0, 0
+			var oldData, newData []byte
+			if be, ok := baseFlat[p]; ok {
+				if bo := r.Objects[be.OID]; bo != nil {
+					oldData = bo.Data
+				}
+			}
+			if he, ok := headFlat[p]; ok {
+				if ho := r.Objects[he.OID]; ho != nil {
+					newData = ho.Data
+				}
+			}
+			add, del = lineDiff(oldData, newData)
+			b = append(b, `{"filename":`...)
+			b = jsonEscape(b, p)
+			b = append(b, `,"status":`...)
+			b = jsonEscape(b, status)
+			b = append(b, `,"additions":`...)
+			b = strconv.AppendInt(b, int64(add), 10)
+			b = append(b, `,"deletions":`...)
+			b = strconv.AppendInt(b, int64(del), 10)
+			b = append(b, `,"changes":`...)
+			b = strconv.AppendInt(b, int64(add+del), 10)
+			b = append(b, `}`...)
+		}
+		b = append(b, ']')
+		out := make([]byte, len(b))
+		copy(out, b)
+		putBuf(bp)
+		s.store.mu.RUnlock()
+		res.body = out
+		return
+	}
+	if len(parts) == 2 && parts[1] == "merge" && req.method == "PUT" {
+		if len(req.body) > 0 && !validJSON(req.body) {
+			s.restError(res, 400, "Invalid JSON")
+			return
+		}
+		s.store.mu.Lock()
+		pr := r.PullByNum[num]
+		if pr == nil {
+			s.store.mu.Unlock()
+			s.restError(res, 404, "Not Found")
+			return
+		}
+		if pr.Merged || pr.State == "closed" {
+			s.store.mu.Unlock()
+			s.restError(res, 405, "Pull request already merged or closed")
+			return
+		}
+		// recompute conflict at merge time (base may have moved)
+		pr.mergeConflict = s.pullConflict(r, pr)
+		if pr.mergeConflict {
+			s.store.mu.Unlock()
+			s.restError(res, 405, "Merge conflict")
+			return
+		}
+		headTip, _ := r.Refs["refs/heads/"+pr.HeadRef]
+		baseTip, _ := r.Refs["refs/heads/"+pr.BaseRef]
+		headTree := ""
+		if obj := r.Objects[headTip]; obj != nil && obj.Type == "commit" {
+			headTree = parseCommit(obj.Data).Tree
+		}
+		var parents []string
+		if baseTip != "" {
+			parents = []string{baseTip}
+		}
+		mergeSHA := s.makeCommit(r, headTree, parents, pr.Title+" (#"+strconv.Itoa(pr.Number)+")")
+		r.Refs["refs/heads/"+pr.BaseRef] = mergeSHA
+		r.packVer++
+		pr.Merged = true
+		pr.State = "closed"
+		pr.MergeCommit = mergeSHA
+		pr.MergedAt = "2026-11-14T06:30:00Z"
+		s.store.mu.Unlock()
+		bp := getBuf()
+		b := *bp
+		b = append(b, `{"sha":`...)
+		b = jsonEscape(b, mergeSHA)
+		b = append(b, `,"merged":true,"message":`...)
+		b = jsonEscape(b, "Pull request successfully merged")
+		b = append(b, `}`...)
+		out := make([]byte, len(b))
+		copy(out, b)
+		putBuf(bp)
+		res.body = out
+		return
+	}
+	s.restError(res, 404, "Not Found")
 }
