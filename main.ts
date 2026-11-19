@@ -1,38 +1,34 @@
-// main.ts — the forge's entrypoint: bind the server, register its port with the trial env,
-// then wait until the env says the trial is done and exit 0. Without an env (local runs)
-// it simply serves on PORT for testing.
+// main.ts — the forge's entrypoint for the trial.
 //
-// The env lifecycle, as the kit settles it: bind an ephemeral port (never 8080, the env owns
-// it), POST {"port": N} to $MAKEFUN_ENV_URL/register (200 wins, 409 means another entry won
-// first and this process keeps waiting, 400/405 are fatal), then poll GET
-// $MAKEFUN_ENV_URL/done until it answers {"done": true}. Retries use a short exponential
-// backoff; the process never exits before the env says done.
+// The trial runs `node main.ts`. This file starts the Go core, learns the port
+// it bound from the `FORGE_LISTEN <port>` line it prints, registers that port
+// with the trial env (when MAKEFUN_ENV_URL is set), and waits until the env
+// answers done, then stops the core and exits 0. With no env set it simply
+// serves locally until stopped.
+//
+// The core binary ships in ./go/forge. Web-UI uploads lose the exec bit and
+// /bot may be read-only in a trial, so the binary is copied to a fresh temp
+// dir and made executable there before it is spawned.
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { chmod, copyFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-/** One register or done request may take this long before it is abandoned and retried. */
 const REQUEST_BUDGET_MS = 30_000;
-/** The first wait between retries, and the longest wait. */
 const FIRST_RETRY_MS = 250;
 const LONGEST_RETRY_MS = 2_000;
 
-const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const wait = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The wait after `failures` failed attempts: doubling from FIRST_RETRY_MS, capped. */
 function backoff(failures: number): number {
   return Math.min(LONGEST_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(failures, 8));
 }
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 
-/**
- * Tell the env which port the forge bound. 200 is the normal answer; 409 means a first
- * register already won, which is not this process's to fix. 400 and 405 are contract
- * errors and end the program; anything else is retried, since the env may still be starting.
- */
+/** Register the bound port. 200 is normal; 409 means another entry won first. */
 async function announcePort(envUrl: string, port: number): Promise<void> {
   for (let failures = 0; ; failures += 1) {
     try {
@@ -53,30 +49,26 @@ async function announcePort(envUrl: string, port: number): Promise<void> {
   }
 }
 
-/** Poll GET /done until it answers {"done": true}; never return before that. */
+/** Poll GET /done until it answers {done: true}; never return before that. */
 async function waitUntilDone(envUrl: string): Promise<void> {
   for (let failures = 0; ; failures += 1) {
     try {
-      const answer = await fetch(`${envUrl}/done`, { signal: AbortSignal.timeout(REQUEST_BUDGET_MS) });
+      const answer = await fetch(`${envUrl}/done`, {
+        signal: AbortSignal.timeout(REQUEST_BUDGET_MS),
+      });
       if (answer.ok) {
         const body = (await answer.json()) as { done?: unknown };
         if (body.done === true) return;
       }
     } catch {
-      // The env is not answering yet, or the poll timed out: it is not done, so poll again.
+      // The env is not answering yet: it is not done, so poll again.
     }
     await wait(backoff(failures));
   }
 }
 
-/**
- * Start the Go core: the shipped binary is copied to a fresh temp dir (web-UI uploads
- * lose the exec bit and /bot may be read-only there), made executable, spawned with
- * this process's environment (so it sees MAKEFUN_SHOP_TOKEN), and its FORGE_LISTEN
- * line read back for the port it bound. The core serves every surface; this process
- * only registers the port with the env and waits for done.
- */
-async function launchGoCore(): Promise<{ child: ChildProcess; port: number }> {
+/** Copy the core to a temp dir, make it executable, spawn it, read its port. */
+async function launchCore(): Promise<{ child: ChildProcess; port: number }> {
   const dir = await mkdtemp(join(tmpdir(), 'forge-'));
   const binPath = join(dir, 'forge');
   await copyFile(new URL('./go/forge', import.meta.url), binPath);
@@ -94,7 +86,7 @@ async function launchGoCore(): Promise<{ child: ChildProcess; port: number }> {
       if (match === null) {
         if (!settled) {
           settled = true;
-          reject(new Error(`unexpected Go core output: ${line}`));
+          reject(new Error(`unexpected core output: ${line}`));
         }
         return;
       }
@@ -106,7 +98,7 @@ async function launchGoCore(): Promise<{ child: ChildProcess; port: number }> {
     child.once('close', (code) => {
       if (!settled) {
         settled = true;
-        reject(new Error(`Go core exited before listening (code ${code})`));
+        reject(new Error(`core exited before listening (code ${code})`));
       }
     });
     child.once('error', (err) => {
@@ -119,10 +111,8 @@ async function launchGoCore(): Promise<{ child: ChildProcess; port: number }> {
   return { child, port };
 }
 
-/** Bind the forge, register with the env when one exists, and run until the env says done. */
 async function run(): Promise<void> {
-  const { child, port } = await launchGoCore();
-  // If this launcher is killed, take the core down with it instead of orphaning it.
+  const { child, port } = await launchCore();
   process.once('SIGINT', () => {
     child.kill();
     process.exit(130);
@@ -133,18 +123,14 @@ async function run(): Promise<void> {
   });
 
   if (ENV_URL === '') {
-    // Local run: serve on the core's port for testing, no env to register with.
     process.stdout.write(`[forge] listening on http://127.0.0.1:${port} (no MAKEFUN_ENV_URL; local mode)\n`);
-    // Stay alive serving requests until the process is stopped.
     await new Promise<void>(() => {});
     return;
   }
 
   process.stdout.write(`[forge] listening on port ${port}\n`);
-
   await announcePort(ENV_URL, port);
   process.stdout.write('[forge] registered; waiting for the env to say done\n');
-
   await waitUntilDone(ENV_URL);
   child.kill();
   await new Promise<void>((resolve) => child.once('close', () => resolve()));

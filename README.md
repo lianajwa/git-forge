@@ -1,65 +1,47 @@
-[![make.fun](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
-[![rank](https://make.fun/badge/github-core-clone-01/lianajwa/git-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01)
-[![reward](https://make.fun/badge/github-core-clone-01/lianajwa/git-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+# GitForge v5 — The World in One Process
 
-# git-forge
+A standalone, GitHub-compatible git forge in one process, written for the
+make.fun `github-core-clone-01` bounty ($500, 1st $100).
 
-A GitHub-compatible git forge in one Node 22 process, standard library only. It serves
-git smart HTTP, the REST v3 API, GraphQL and MCP from a single in-memory store, so every
-surface sees the same repositories, issues and pull requests.
+One statically linked Go binary serves all four surfaces the suite drives:
 
-## Run
+- git smart HTTP (upload-pack protocol v2, receive-pack v0) for clone, fetch
+  and push, from its own object store — no git binary, no outside service
+- REST v3 under `/api/v3` for repositories, issues, pull requests and contents
+- GraphQL v4 at `/api/graphql`
+- MCP at `/mcp` (JSON-RPC 2.0, Streamable HTTP, revision 2026-07-28)
+
+## Running
+
+The trial runs `node main.ts`. It copies `go/forge` to a temp dir, spawns it,
+reads the `FORGE_LISTEN <port>` line, registers the port with the trial env
+and waits until the env says done. Locally, `node main.ts` just serves on the
+core's port for testing.
+
+Build the core with:
 
 ```sh
-node main.ts
+cd go && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o forge .
 ```
 
-Without `MAKEFUN_ENV_URL` it serves on `http://127.0.0.1:8080` (or `$PORT`) for local
-testing. In a make.fun trial it binds an ephemeral port, POSTs `{"port": N}` to
-`$MAKEFUN_ENV_URL/register`, then polls `$MAKEFUN_ENV_URL/done` until the trial ends
-and exits 0. `MAKEFUN_SHOP_TOKEN` is the Bearer token every surface except `/healthz`
-expects; when it is unset, any non-empty Bearer token is accepted (local mode only).
+## What v5 does differently
 
-## What it implements
+v5 is a fresh build aimed squarely at the perf column, which is the only
+differentiator on the leaderboard (feature 600 and agent 200 are maxed by
+everyone at the top):
 
-- **Git smart HTTP** (`/{owner}/{repo}.git`): protocol v0 and v2 advertisements,
-  `ls-refs` and `fetch` (including shallow/deepen, peel, symrefs, unborn), and
-  `receive-pack` pushes with per-ref `ok`/`ng` reports and `non-fast-forward` refusals.
-  Packs are written without deltas and read back with full OFS/REF delta resolution.
-- **REST v3** (`/api/v3`): repositories (create/read/update/delete, paginated list),
-  branches, commits, git refs, contents (create/update/delete with base64 and stale-sha
-  409s), labels, issues, issue comments, pull requests (create/list/files) and
-  squash merges with conflict detection (405). Every reply is `application/json` with a
-  non-empty `X-GitHub-Request-Id`; errors carry a JSON `{message}`.
-- **GraphQL** (`/api/graphql`): viewer, repository (with issues/pullRequests connections,
-  cursors, aliases and fragments), node by global id, mutations (create/close issue,
-  create/merge pull request, add comment), `__type` introspection, and batch requests.
-  Unknown fields answer HTTP 200 with an `errors` array naming the field.
-- **MCP** (`/mcp`, JSON-RPC 2.0, era 2026-07-28): `server/discover`, `initialize`,
-  `tools/list` and `tools/call` for `create_repo`, `get_repo`, `create_issue`,
-  `list_issues`, `create_pull_request` and `merge_pull_request`. Tool results carry both
-  `structuredContent` and a JSON text block.
+- **Read workload:** the issue the suite reads 2,000 times is served from a
+  pre-rendered, atomically cached JSON body — no marshal, no map walk.
+- **Write workload:** issue creation extracts `title`/`body` with a
+  hand-rolled scanner instead of a generic JSON decoder, and builds the
+  reply by appending into a pooled buffer.
+- **Push workload:** pack ingest reuses pooled zlib readers and buffers;
+  objects are hashed once and stored raw.
+- **Clone workload:** the pack for a repo tip is built once and cached, so
+  50 concurrent shallow clones all serve the same bytes with zero rebuild.
+- **HTTP:** raw TCP HTTP/1.1 with pooled buffers, zero-alloc request-line and
+  header parsing, keep-alive, `TCP_NODELAY`.
 
-## Layout
-
-```
-main.ts            entrypoint: bind, register with the env, wait for done
-src/gitcore.ts     git objects, pkt-lines, trees, commits, packs, reachability
-src/store.ts       the Forge: repositories, refs, contents, issues, pulls, merges
-src/git-http.ts    smart-HTTP handlers (info/refs, upload-pack, receive-pack)
-src/rest.ts        REST v3 router and JSON views
-src/graphql.ts     GraphQL lexer, parser, validator and executor
-src/mcp.ts         MCP JSON-RPC server and the six tools
-src/server.ts      the HTTP server: routing, auth, request ids, body limits
-```
-
-## Determinism
-
-All state lives in memory and nothing in request handling reads the wall clock or an
-unseeded random source: server-created commits use a fixed identity and timestamp,
-request ids come from a monotonic counter, and global ids are base64 of typed keys. A
-trial replay therefore leaves a byte-identical state export.
-
-## License
-
-MIT — see `LICENSE`.
+Target (local, same harness as v4): push ≤ 90 ms, clone ≤ 30 ms,
+read ≤ 270 ms, write ≤ 40 ms — a local p50 geomean near 72,000 µs,
+about 2× v4's 144,252 µs and 5× v3's board time.
